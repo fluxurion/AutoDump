@@ -1,0 +1,12 @@
+# Built binaries
+*.exe
+*.dll
+
+# Dump output files
+*.bin
+*.dmp
+*.txt
+
+# Compiler artifacts
+*.o
+*.obj

@@ -4,13 +4,27 @@ A comprehensive toolkit for process reverse engineering:
 - **Stealth DLL Injector** - Reflective injection with thread hijacking
 - **Helper DLL** - Dumps decrypted memory + extracts ALL offsets automatically
 
-  
 ## Compilation
 
 ```bash
 gcc -O2 -o injector.exe injector.c
 gcc -O2 -shared -o helper.dll helper_dll.c
+gcc -O2 -mwindows -o injector_gui.exe injector_gui.c -lcomctl32 -lcomdlg32
 ```
+
+Or simply run the provided batch file:
+
+```bash
+compile.bat
+```
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `injector.exe` | CLI injector — run from command line |
+| `helper.dll` | Stealth helper DLL — loaded reflectively |
+| `injector_gui.exe` | Simple GUI launcher — browse for a target `.exe` and inject with one click |
 
 ## Usage
 
@@ -127,10 +141,51 @@ gcc -O2 -shared -o helper.dll helper_dll.c
 
 ## Requirements
 
-- Windows 10/11 x64
-- Administrator privileges
-- GCC compiler (MinGW-w64 recommended)
-- Target process must be running (or will wait for it)
+- **Windows 10/11 x64** (x86/32-bit not supported)
+- **Administrator privileges** (required to open target processes)
+- **MinGW-w64 GCC** (the code uses GNU inline assembly — MSVC will **not** work)
+- **Target process** must be running (injector will wait for it)
+
+### Installing MinGW-w64
+
+#### Option 1: MSYS2 (Recommended)
+
+1. Download and run the installer from [msys2.org](https://www.msys2.org/)
+2. Open **MSYS2 UCRT64** from the Start Menu
+3. Update packages and install GCC:
+   ```bash
+   pacman -Syu
+   pacman -S mingw-w64-ucrt-x86_64-gcc
+   ```
+4. Add `C:\msys64\ucrt64\bin` to your **System PATH** environment variable
+5. Verify the installation:
+   ```bash
+   gcc --version
+   ```
+
+#### Option 2: MinGW-w64 standalone (winlibs.com)
+
+1. Download the latest **UCRT** runtime GCC package from [winlibs.com](https://winlibs.com/)
+2. Extract the archive (e.g. to `C:\mingw64`)
+3. Add `C:\mingw64\bin` to your **System PATH** environment variable
+4. Verify the installation:
+   ```bash
+   gcc --version
+   ```
+
+#### Option 3: winget (Windows built-in)
+
+```bash
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT --accept-source-agreements
+```
+
+This installs WinLibs (POSIX threads, UCRT runtime) — no manual PATH setup needed.
+
+#### Option 4: Chocolatey
+
+```bash
+choco install mingw
+```
 
 ## Notes
 - dont run this

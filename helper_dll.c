@@ -10,6 +10,47 @@
 #define MAX_OFFSETS 32000
 #define MAX_NAME_LEN 128
 
+/*
+ * Output directory config block.
+ * The injector scans the DLL image for MAGIC_OUTPUT_DIR, then writes
+ * the absolute path (with trailing backslash) into g_outputPath.
+ * The helper DLL uses this path as the base for all output files.
+ */
+#define MAGIC_OUTPUT_DIR 0x525449525450554fULL /* "OUTPUTDIR" */
+
+/*
+ * Output config block — MUST be in the .data section (not .bss)!
+ * Zero-initialized globals go to .bss which has no file data,
+ * so the injector's marker scan can't find them.
+ * Initializing g_outputPath[0]=1 forces it into .data alongside
+ * the magic marker, keeping both at known file-to-VA offsets.
+ */
+__declspec(align(32)) volatile UINT64 g_outputDirMagic  = MAGIC_OUTPUT_DIR;
+/* First byte = 1, rest = 0 — keeps this in .data, not .bss */
+__declspec(align(32)) volatile char    g_outputPath[MAX_PATH] = {1};
+
+/*
+ * Build a full output path by prepending g_outputPath (if set) to filename.
+ * Returns pointer to static buffer — valid until next call.
+ */
+static const char* OutputPath(const char* filename) {
+    static char buf[MAX_PATH * 2];
+    /* Check if a real output path was set by the injector.
+     * The sentinel value g_outputPath[0]==1 means "not yet set"
+     * (we initialize to {1} to keep the variable in .data, not .bss). */
+    if (g_outputPath[0] > 1) {
+        size_t plen = strnlen((const char*)g_outputPath, MAX_PATH);
+        if (plen > 0 && g_outputPath[plen-1] == '\\')
+            snprintf(buf, sizeof(buf), "%s%s", (const char*)g_outputPath, filename);
+        else
+            snprintf(buf, sizeof(buf), "%s\\%s", (const char*)g_outputPath, filename);
+    } else {
+        /* No directory path set — use filename as-is (relative = target CWD) */
+        snprintf(buf, sizeof(buf), "%s", filename);
+    }
+    return buf;
+}
+
 typedef enum {
     OFFSET_LUA_FUNCTION,
     OFFSET_BINDING_COMMAND,
@@ -1150,8 +1191,8 @@ static void StealthCloseFile(HANDLE hFile) {
 }
 
 static void DebugLog(const char* msg) {
-    HANDLE hFile = CreateFileA("helper_debug.txt", FILE_APPEND_DATA, 
-                                FILE_SHARE_READ | FILE_SHARE_WRITE, 
+    HANDLE hFile = CreateFileA(OutputPath("helper_debug.txt"), FILE_APPEND_DATA,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD written;
@@ -1465,7 +1506,7 @@ static void ExtractGlobalOffsets(PVOID moduleBase, uint8_t* dumpBuffer, DWORD im
 static void WriteOffsetsFile(PVOID moduleBase) {
     char logBuf[128];
     
-    HANDLE hFile = CreateFileA("wow_offsets.txt", GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(OutputPath("wow_offsets.txt"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
         DebugLog("Failed to create wow_offsets.txt");
@@ -1592,7 +1633,7 @@ static void DumpLoaderExports(PVOID loaderBase, PIMAGE_NT_HEADERS pNt) {
     DWORD* funcRvas = (DWORD*)((LPBYTE)loaderBase + pExport->AddressOfFunctions);
     WORD* ordinals = (WORD*)((LPBYTE)loaderBase + pExport->AddressOfNameOrdinals);
     
-    HANDLE hFile = CreateFileA("wow_loader_exports.txt", GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(OutputPath("wow_loader_exports.txt"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
     
@@ -1653,7 +1694,7 @@ static void ExtractLoaderFunctions(uint8_t* dumpBuffer, DWORD imageSize, PIMAGE_
         return;
     }
     
-    HANDLE hFile = CreateFileA("wow_loader_functions.txt", GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(OutputPath("wow_loader_functions.txt"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
     
@@ -1700,7 +1741,7 @@ static void ExtractLoaderFunctions(uint8_t* dumpBuffer, DWORD imageSize, PIMAGE_
 static void ExtractLoaderCrypto(uint8_t* dumpBuffer, DWORD imageSize) {
     char logBuf[256];
     
-    HANDLE hFile = CreateFileA("wow_loader_crypto.txt", GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(OutputPath("wow_loader_crypto.txt"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
     
@@ -1872,7 +1913,7 @@ static void DumpWowLoader(void) {
     }
     pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
     
-    HANDLE hFile = CreateFileA("wow_loader_dump.bin", GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(OutputPath("wow_loader_dump.bin"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -2099,11 +2140,11 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         DebugLog("Could not parse sections for offset extraction");
     }
     
-    HANDLE hFile = StealthCreateFile("wow_dump.bin");
+    HANDLE hFile = StealthCreateFile(OutputPath("wow_dump.bin"));
     BOOL useStealth = (hFile != INVALID_HANDLE_VALUE);
     
     if (!useStealth) {
-        hFile = CreateFileA("wow_dump.bin", GENERIC_WRITE, 0, NULL, 
+        hFile = CreateFileA(OutputPath("wow_dump.bin"), GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     }
     
