@@ -689,7 +689,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             /* ── Target path row ── */
             HWND hLbl = CreateWindowA("STATIC", "Target:",
-                WS_CHILD | WS_VISIBLE | SS_VCENTER,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 MARGIN, ROW1_Y + 3, 52, 22, hWnd, NULL, hInst, NULL);
             if (g_hFontUI) SendMessage(hLbl, WM_SETFONT, (WPARAM)g_hFontUI, 0);
 
