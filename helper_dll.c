@@ -2269,24 +2269,73 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     
     CleanupForcedDecryption();
     
-    PIMAGE_DOS_HEADER pDumpDos = (PIMAGE_DOS_HEADER)dumpBuffer;
-    PIMAGE_NT_HEADERS pDumpNt = (PIMAGE_NT_HEADERS)((LPBYTE)dumpBuffer + pDumpDos->e_lfanew);
-    PIMAGE_SECTION_HEADER pDumpSections = IMAGE_FIRST_SECTION(pDumpNt);
-    
-    for (WORD i = 0; i < pDumpNt->FileHeader.NumberOfSections; i++) {
-        PIMAGE_SECTION_HEADER pSec = &pDumpSections[i];
-        pSec->PointerToRawData = pSec->VirtualAddress;
-        pSec->SizeOfRawData = pSec->Misc.VirtualSize;
-    }
-    pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
-    
-    if (pDumpNt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT) {
-        pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
-        pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
-    }
-    if (pDumpNt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY) {
-        pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = 0;
-        pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 0;
+    /* ── Comprehensive PE header fixup ── */
+    {
+        PIMAGE_DOS_HEADER pDumpDos = (PIMAGE_DOS_HEADER)dumpBuffer;
+        PIMAGE_NT_HEADERS pDumpNt  = (PIMAGE_NT_HEADERS)((LPBYTE)dumpBuffer + pDumpDos->e_lfanew);
+        PIMAGE_SECTION_HEADER pDumpSections = IMAGE_FIRST_SECTION(pDumpNt);
+        DWORD numDir = pDumpNt->OptionalHeader.NumberOfRvaAndSizes;
+
+        /* 1. Section table: align raw offsets with virtual layout */
+        for (WORD i = 0; i < pDumpNt->FileHeader.NumberOfSections; i++) {
+            PIMAGE_SECTION_HEADER pSec = &pDumpSections[i];
+            pSec->PointerToRawData = pSec->VirtualAddress;
+            pSec->SizeOfRawData    = pSec->Misc.VirtualSize;
+        }
+        pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
+
+        /* 2. Reset ImageBase to a conventional 64-bit base so IDA
+         *    loads at a predictable address instead of the runtime VA. */
+        pDumpNt->OptionalHeader.ImageBase = 0x140000000ULL;
+
+        /* 3. Zero directories that are runtime-only or invalid in a file dump */
+#define ZERO_DIR(idx) \
+        if (numDir > (idx)) { \
+            pDumpNt->OptionalHeader.DataDirectory[(idx)].VirtualAddress = 0; \
+            pDumpNt->OptionalHeader.DataDirectory[(idx)].Size = 0; \
+        }
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_SECURITY)       /* Authenticode sig  */
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT)   /* Bound imports     */
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BASERELOC)      /* Relocation table  */
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_DEBUG)          /* Debug / CodeView  */
+#undef ZERO_DIR
+
+        /* 4. Validate .pdata (exception directory) entries.
+         *    Each RUNTIME_FUNCTION has {BeginAddress, EndAddress, UnwindData}
+         *    all as RVAs. If any field is outside [0, imageSize) the entry
+         *    is garbage — zero it so IDA doesn't skip the function. */
+        DWORD pdataRva  = 0, pdataSize = 0;
+        if (numDir > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+            pdataRva  = pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+            pdataSize = pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+        }
+        DWORD badPdata = 0, goodPdata = 0;
+        if (pdataRva && pdataSize && pdataRva + pdataSize <= imageSize) {
+            typedef struct { DWORD Begin; DWORD End; DWORD Unwind; } RF;
+            RF* rf    = (RF*)((LPBYTE)dumpBuffer + pdataRva);
+            DWORD cnt = pdataSize / sizeof(RF);
+            DWORD i;
+            for (i = 0; i < cnt; i++) {
+                BOOL bad = (rf[i].Begin  == 0 && rf[i].End == 0) ||
+                           rf[i].Begin  >= imageSize ||
+                           rf[i].End    >  imageSize ||
+                           rf[i].Unwind >= imageSize ||
+                           rf[i].Begin  >= rf[i].End;
+                if (bad) {
+                    rf[i].Begin = rf[i].End = rf[i].Unwind = 0;
+                    badPdata++;
+                } else {
+                    goodPdata++;
+                }
+            }
+            DebugLogFmt("pdata: %lu good, %lu bad zeroed", goodPdata, badPdata);
+        }
+
+        /* 5. Zero the DLL flag so IDA treats it as an EXE */
+        pDumpNt->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
+
+        DebugLogFmt("PE fixup done: ImageBase=0x140000000, reloc/debug/security zeroed, %lu bad pdata cleared",
+                    badPdata);
     }
     
     ScanAndTrackTlsCallbacks(moduleBase);
