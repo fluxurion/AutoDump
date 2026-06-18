@@ -2410,12 +2410,17 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT)   /* Bound imports     */
         ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BASERELOC)      /* Relocation table  */
         ZERO_DIR(IMAGE_DIRECTORY_ENTRY_DEBUG)          /* Debug / CodeView  */
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_EXPORT)         /* Exports (EXE has none) */
 #undef ZERO_DIR
 
-        /* 4. Validate .pdata (exception directory) entries.
+        /* 4. Validate and compact .pdata (exception directory) entries.
          *    Each RUNTIME_FUNCTION has {BeginAddress, EndAddress, UnwindData}
-         *    all as RVAs. If any field is outside [0, imageSize) the entry
-         *    is garbage — zero it so IDA doesn't skip the function. */
+         *    all as RVAs. We check:
+         *    a) RVAs within [0, imageSize)
+         *    b) Begin < End
+         *    c) UnwindData points to a byte whose low 3 bits == 1 (UNWIND_INFO version)
+         *    Bad entries are removed by compacting the array and shrinking the
+         *    directory size, so IDA only sees valid functions. */
         DWORD pdataRva  = 0, pdataSize = 0;
         if (numDir > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
             pdataRva  = pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
@@ -2424,8 +2429,9 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         DWORD badPdata = 0, goodPdata = 0;
         if (pdataRva && pdataSize && pdataRva + pdataSize <= imageSize) {
             typedef struct { DWORD Begin; DWORD End; DWORD Unwind; } RF;
-            RF* rf    = (RF*)((LPBYTE)dumpBuffer + pdataRva);
-            DWORD cnt = pdataSize / sizeof(RF);
+            RF* rf       = (RF*)((LPBYTE)dumpBuffer + pdataRva);
+            DWORD cnt    = pdataSize / sizeof(RF);
+            DWORD keep   = 0;
             DWORD i;
             for (i = 0; i < cnt; i++) {
                 BOOL bad = (rf[i].Begin  == 0 && rf[i].End == 0) ||
@@ -2433,14 +2439,31 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
                            rf[i].End    >  imageSize ||
                            rf[i].Unwind >= imageSize ||
                            rf[i].Begin  >= rf[i].End;
+                /* Extra check: verify unwind info version byte (low 3 bits should be 1) */
+                if (!bad && rf[i].Unwind < imageSize) {
+                    BYTE ver = *((LPBYTE)dumpBuffer + rf[i].Unwind);
+                    if ((ver & 0x07) != 1)
+                        bad = TRUE;
+                }
                 if (bad) {
-                    rf[i].Begin = rf[i].End = rf[i].Unwind = 0;
                     badPdata++;
                 } else {
+                    if (keep != i)
+                        rf[keep] = rf[i]; /* compact */
+                    keep++;
                     goodPdata++;
                 }
             }
-            DebugLogFmt("pdata: %lu good, %lu bad zeroed", goodPdata, badPdata);
+            /* Zero out the trailing entries we removed */
+            DWORD removed = cnt - keep;
+            if (removed > 0) {
+                memset(&rf[keep], 0, removed * sizeof(RF));
+                /* Shrink the directory size to only cover valid entries */
+                pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size =
+                    keep * sizeof(RF);
+            }
+            DebugLogFmt("pdata: %lu good, %lu bad removed (size %lu -> %lu)",
+                        goodPdata, badPdata, cnt, keep);
         }
 
         /* 5. Zero the DLL flag so IDA treats it as an EXE */
