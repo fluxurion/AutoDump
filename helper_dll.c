@@ -1138,96 +1138,208 @@ static void ReconstructTlsCallbacks(PVOID imageBase, PVOID dumpBuffer, SIZE_T im
     }
 }
 
+/*
+ * ReconstructIAT - rebuilds the Import Address Table in the dump buffer.
+ *
+ * The live IAT slots contain runtime VAs which are meaningless in a file dump.
+ * Strategy:
+ *   1. Walk each import descriptor using OriginalFirstThunk (INT); if that is
+ *      absent (packed EXE) fall back to scanning the live FirstThunk slot to
+ *      reverse-lookup the function name via the loaded module's export table.
+ *   2. Write a synthetic hint/name table into the dump's free space after the
+ *      last section so each IAT slot's OriginalFirstThunk entry points to a
+ *      real IMAGE_IMPORT_BY_NAME record with the function name.
+ *   3. Leave the IAT (FirstThunk) slots pointing to the hint/name RVA as well
+ *      (pre-snap state) — IDA will resolve them symbolically.
+ */
+
+/* Reverse-lookup a VA in a loaded module's export table to get the name */
+static const char* ReverseLookupExport(HMODULE hMod, FARPROC target) {
+    static char nameBuf[256];
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hMod;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)hMod + pDos->e_lfanew);
+    DWORD expRva = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!expRva) return NULL;
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)hMod + expRva);
+    DWORD* addrTable = (DWORD*)((LPBYTE)hMod + pExp->AddressOfFunctions);
+    DWORD* nameTable = (DWORD*)((LPBYTE)hMod + pExp->AddressOfNames);
+    WORD*  ordTable  = (WORD* )((LPBYTE)hMod + pExp->AddressOfNameOrdinals);
+    ULONG_PTR base   = (ULONG_PTR)hMod;
+    ULONG_PTR tgt    = (ULONG_PTR)target;
+    DWORD i;
+    for (i = 0; i < pExp->NumberOfNames; i++) {
+        ULONG_PTR fn = base + addrTable[ordTable[i]];
+        if (fn == tgt) {
+            const char* name = (const char*)((LPBYTE)hMod + nameTable[i]);
+            strncpy(nameBuf, name, sizeof(nameBuf) - 1);
+            nameBuf[sizeof(nameBuf) - 1] = 0;
+            return nameBuf;
+        }
+    }
+    return NULL;
+}
+
+static HMODULE FindModuleInPEB(const char* dllName) {
+    PPEB peb = GET_PEB();
+    if (!peb || !peb->Ldr) return NULL;
+    PLIST_ENTRY entry = peb->Ldr->InLoadOrderModuleList.Flink;
+    while (entry != &peb->Ldr->InLoadOrderModuleList) {
+        PLDR_DATA_TABLE_ENTRY ldr = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        if (ldr->BaseDllName.Buffer) {
+            char name[256] = {0};
+            WideCharToMultiByte(CP_ACP, 0, ldr->BaseDllName.Buffer,
+                                ldr->BaseDllName.Length / sizeof(WCHAR),
+                                name, sizeof(name) - 1, NULL, NULL);
+            if (_stricmp(name, dllName) == 0)
+                return (HMODULE)ldr->DllBase;
+        }
+        entry = entry->Flink;
+    }
+    return NULL;
+}
+
 static BOOL ReconstructIAT(PVOID imageBase, PVOID dumpBuffer, SIZE_T imageSize) {
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)imageBase;
     if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
-    
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)imageBase + pDos->e_lfanew);
     if (pNt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
-    
+
     DWORD importRva = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!importRva) return FALSE;
-    
-    PIMAGE_IMPORT_DESCRIPTOR pImport = (PIMAGE_IMPORT_DESCRIPTOR)((LPBYTE)imageBase + importRva);
-    
-    IMAGE_IMPORT_DESCRIPTOR importDesc;
-    int dllCount = 0;
-    int funcCount = 0;
-    
-    while (TRUE) {
-        SpoofedMemcpy(&importDesc, pImport, sizeof(IMAGE_IMPORT_DESCRIPTOR));
-        if (!importDesc.Name) break;
-        
-        char dllName[256] = {0};
-        char* dllNamePtr = (char*)((LPBYTE)imageBase + importDesc.Name);
-        SpoofedMemcpy(dllName, dllNamePtr, sizeof(dllName) - 1);
-        
-        HMODULE hModule = NULL;
-        PPEB peb = GET_PEB();
-        if (peb && peb->Ldr) {
-            PLIST_ENTRY entry = peb->Ldr->InLoadOrderModuleList.Flink;
-            while (entry != &peb->Ldr->InLoadOrderModuleList) {
-                PLDR_DATA_TABLE_ENTRY ldrEntry = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-                if (ldrEntry->BaseDllName.Buffer) {
-                    char entryName[256] = {0};
-                    WideCharToMultiByte(CP_ACP, 0, ldrEntry->BaseDllName.Buffer,
-                                       ldrEntry->BaseDllName.Length / sizeof(WCHAR),
-                                       entryName, sizeof(entryName) - 1, NULL, NULL);
-                    if (_stricmp(entryName, dllName) == 0) {
-                        hModule = (HMODULE)ldrEntry->DllBase;
-                        break;
-                    }
-                }
-                entry = entry->Flink;
-            }
-        }
-        
-        if (!hModule) {
-            pImport++;
-            continue;
-        }
-        
-        dllCount++;
-        
-        if (importDesc.OriginalFirstThunk) {
-            PIMAGE_THUNK_DATA pOrigThunk = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + importDesc.OriginalFirstThunk);
-            PIMAGE_THUNK_DATA pDumpThunk = (PIMAGE_THUNK_DATA)((LPBYTE)dumpBuffer + importDesc.FirstThunk);
-            
-            IMAGE_THUNK_DATA thunk;
-            int idx = 0;
-            
-            while (idx < 10000) {
-                SpoofedMemcpy(&thunk, &pOrigThunk[idx], sizeof(IMAGE_THUNK_DATA));
-                if (!thunk.u1.AddressOfData) break;
-                
-                FARPROC proc = NULL;
-                
-                if (thunk.u1.Ordinal & IMAGE_ORDINAL_FLAG) {
-                    WORD ordinal = (WORD)(thunk.u1.Ordinal & 0xFFFF);
-                    proc = GetProcAddress(hModule, (LPCSTR)(ULONG_PTR)ordinal);
-                } else {
-                    DWORD_PTR hintNameRva = thunk.u1.AddressOfData;
-                    if (hintNameRva < imageSize) {
-                        PIMAGE_IMPORT_BY_NAME pName = (PIMAGE_IMPORT_BY_NAME)((LPBYTE)imageBase + hintNameRva);
-                        char funcName[256] = {0};
-                        SpoofedMemcpy(funcName, pName->Name, sizeof(funcName) - 1);
-                        if (funcName[0]) {
-                            proc = GetProcAddress(hModule, funcName);
-                        }
-                    }
-                }
-                
-                if (proc) {
-                    pDumpThunk[idx].u1.Function = (ULONG_PTR)proc;
-                    funcCount++;
-                }
-                idx++;
-            }
-        }
-        
-        pImport++;
+    if (!importRva || importRva >= imageSize) return FALSE;
+
+    /*
+     * Find a writable area after the last section to store the synthetic
+     * hint/name table. We use the gap between SizeOfImage and the actual
+     * last section end, or append to the dump buffer if enough room.
+     */
+    PIMAGE_SECTION_HEADER pSecs = IMAGE_FIRST_SECTION(pNt);
+    DWORD lastSecEnd = 0;
+    WORD  ns = pNt->FileHeader.NumberOfSections;
+    WORD  si;
+    for (si = 0; si < ns; si++) {
+        DWORD end = pSecs[si].VirtualAddress + pSecs[si].Misc.VirtualSize;
+        if (end > lastSecEnd) lastSecEnd = end;
     }
-    
+    /* Align to 16 bytes */
+    lastSecEnd = (lastSecEnd + 15) & ~15u;
+
+    /* Scratch region in dump buffer for hint/name strings */
+    LPBYTE scratch     = (LPBYTE)dumpBuffer + lastSecEnd;
+    DWORD  scratchUsed = 0;
+    DWORD  scratchMax  = (DWORD)(imageSize > lastSecEnd ? imageSize - lastSecEnd : 0);
+
+    int dllCount  = 0;
+    int funcCount = 0;
+    int fallbacks = 0;
+
+    PIMAGE_IMPORT_DESCRIPTOR pDesc = (PIMAGE_IMPORT_DESCRIPTOR)((LPBYTE)imageBase + importRva);
+
+    while (pDesc->Name && (DWORD)((LPBYTE)pDesc - (LPBYTE)imageBase) < imageSize) {
+        char dllName[256] = {0};
+        if (pDesc->Name < imageSize)
+            SpoofedMemcpy(dllName, (LPBYTE)imageBase + pDesc->Name, sizeof(dllName) - 1);
+        if (!dllName[0]) { pDesc++; continue; }
+
+        HMODULE hMod = FindModuleInPEB(dllName);
+        if (!hMod) { pDesc++; continue; }
+
+        dllCount++;
+        int dllFuncs = 0;
+
+        /* Prefer INT (OriginalFirstThunk); fall back to live IAT (FirstThunk) */
+        BOOL hasINT = (pDesc->OriginalFirstThunk != 0 &&
+                       pDesc->OriginalFirstThunk < imageSize);
+
+        PIMAGE_THUNK_DATA pINT  = hasINT
+            ? (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pDesc->OriginalFirstThunk)
+            : (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pDesc->FirstThunk);
+        PIMAGE_THUNK_DATA pIAT  = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase  + pDesc->FirstThunk);
+        PIMAGE_THUNK_DATA pDumpIAT = (PIMAGE_THUNK_DATA)((LPBYTE)dumpBuffer + pDesc->FirstThunk);
+
+        /* Also point OriginalFirstThunk in the dump to same slot initially */
+        PIMAGE_THUNK_DATA pDumpINT = NULL;
+        if (pDesc->OriginalFirstThunk && pDesc->OriginalFirstThunk < imageSize)
+            pDumpINT = (PIMAGE_THUNK_DATA)((LPBYTE)dumpBuffer + pDesc->OriginalFirstThunk);
+
+        int idx = 0;
+        while (idx < 8192) {
+            IMAGE_THUNK_DATA intEntry = {0};
+            SpoofedMemcpy(&intEntry, &pINT[idx], sizeof(intEntry));
+            if (!intEntry.u1.AddressOfData) break;
+
+            char funcName[256] = {0};
+            WORD hint = 0;
+            BOOL byOrdinal = (intEntry.u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
+
+            if (hasINT && !byOrdinal) {
+                /* Read name from INT */
+                DWORD_PTR nameRva = intEntry.u1.AddressOfData;
+                if (nameRva < imageSize) {
+                    PIMAGE_IMPORT_BY_NAME pIBN = (PIMAGE_IMPORT_BY_NAME)((LPBYTE)imageBase + nameRva);
+                    hint = pIBN->Hint;
+                    SpoofedMemcpy(funcName, pIBN->Name, sizeof(funcName) - 1);
+                }
+            } else if (hasINT && byOrdinal) {
+                WORD ord = (WORD)(intEntry.u1.Ordinal & 0xFFFF);
+                FARPROC fn = GetProcAddress(hMod, (LPCSTR)(ULONG_PTR)ord);
+                if (fn) {
+                    const char* n = ReverseLookupExport(hMod, fn);
+                    if (n) strncpy(funcName, n, sizeof(funcName) - 1);
+                    else   snprintf(funcName, sizeof(funcName), "#%u", ord);
+                }
+            } else {
+                /* No INT: reverse-lookup the live IAT VA */
+                IMAGE_THUNK_DATA iatEntry = {0};
+                SpoofedMemcpy(&iatEntry, &pIAT[idx], sizeof(iatEntry));
+                FARPROC fn = (FARPROC)iatEntry.u1.Function;
+                if (!fn) { idx++; continue; }
+                const char* n = ReverseLookupExport(hMod, fn);
+                if (n) { strncpy(funcName, n, sizeof(funcName) - 1); fallbacks++; }
+                else   snprintf(funcName, sizeof(funcName), "ord_%llX",
+                                (unsigned long long)iatEntry.u1.Function);
+            }
+
+            if (!funcName[0]) { idx++; continue; }
+
+            /*
+             * Write a synthetic IMAGE_IMPORT_BY_NAME into the scratch area
+             * and point both the dump INT and dump IAT at its RVA.
+             */
+            DWORD nameLen = (DWORD)strlen(funcName) + 1;
+            DWORD needed  = sizeof(WORD) + nameLen;
+            needed = (needed + 1) & ~1u; /* WORD-align */
+
+            DWORD_PTR hintRva = 0;
+            if (scratchMax >= scratchUsed + needed) {
+                hintRva = lastSecEnd + scratchUsed;
+                PIMAGE_IMPORT_BY_NAME pIBN = (PIMAGE_IMPORT_BY_NAME)(scratch + scratchUsed);
+                pIBN->Hint = hint;
+                memcpy(pIBN->Name, funcName, nameLen);
+                scratchUsed += needed;
+
+                /* IAT slot = RVA of hint/name (pre-snap = unresolved state IDA prefers) */
+                if (pDesc->FirstThunk + idx * sizeof(IMAGE_THUNK_DATA) + sizeof(IMAGE_THUNK_DATA) <= imageSize)
+                    pDumpIAT[idx].u1.AddressOfData = hintRva;
+
+                /* Sync INT in dump */
+                if (pDumpINT &&
+                    pDesc->OriginalFirstThunk + idx * sizeof(IMAGE_THUNK_DATA) + sizeof(IMAGE_THUNK_DATA) <= imageSize)
+                    pDumpINT[idx].u1.AddressOfData = hintRva;
+            }
+
+            dllFuncs++;
+            funcCount++;
+            idx++;
+        }
+
+        DebugLogFmt("  IAT %s: %d funcs (%s)", dllName, dllFuncs,
+                    hasINT ? "INT" : "fallback");
+        pDesc++;
+    }
+
+    DebugLogFmt("IAT: %d DLLs, %d funcs resolved (%d by reverse-lookup)",
+                dllCount, funcCount, fallbacks);
     return (dllCount > 0);
 }
 
