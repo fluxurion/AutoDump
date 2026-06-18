@@ -418,10 +418,11 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         }
     }
 
-    int pollCount = 0;
-    int maxPolls  = 360; /* 360 * 500ms = 180s = 3 min */
+    int pollCount    = 0;
+    int maxPolls     = 360; /* 360 * 500ms = 180s = 3 min */
     int lastFileCount = 0;
     int stableCount  = 0; /* consecutive polls with same count */
+    int lastLoggedSec = -1; /* prevent duplicate interval messages */
 
     /* Resolve the target process name for liveness checks */
     const char* justName = strrchr(processName, '\\');
@@ -507,7 +508,8 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                      "Dumping ... %ds elapsed, %d files (%d stable)",
                      elapsedSec, count, stableCount);
             PostMessageA(g_hWnd, WM_INJECT_LOG, 0, (LPARAM)_strdup(status));
-        } else if (elapsedSec > 0 && elapsedSec % 30 == 0) {
+        } else if (elapsedSec > 0 && elapsedSec % 30 == 0 && elapsedSec != lastLoggedSec) {
+            lastLoggedSec = elapsedSec;
             char status[128];
             int remainSec = 120 - elapsedSec;
             if (remainSec < 0) remainSec = 0;
@@ -605,8 +607,8 @@ static void DrawOwnedButton(DRAWITEMSTRUCT* dis, int idx) {
     HPEN   hpen = CreatePen(PS_SOLID, 1, hover && enabled ? COL_ACCENT : COL_BORDER);
     HBRUSH oldBr = (HBRUSH)SelectObject(dis->hDC, hbr);
     HPEN   oldPen = (HPEN)SelectObject(dis->hDC, hpen);
-    RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
-              dis->rcItem.right, dis->rcItem.bottom, 6, 6);
+    Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+              dis->rcItem.right, dis->rcItem.bottom);
     SelectObject(dis->hDC, oldBr);
     SelectObject(dis->hDC, oldPen);
     DeleteObject(hbr);
@@ -731,10 +733,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             /* ── Hint / Warning banner ── */
             g_hStaticHint = CreateWindowA("STATIC",
-                "Steps:  1. Browse for the target .exe    "
-                "2. Click Launch & Inject (or Inject into Running)    "
-                "3. Wait for dump to finish    "
-                "4. Open Dump Folder to view results",
+                "1. Browse .exe    2. Launch & Inject    3. Wait for dump    4. Open Dump Folder",
                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
                 MARGIN, HINT_Y, WIN_W - MARGIN*2, 30,
                 hWnd, (HMENU)ID_STATIC_HINT, hInst, NULL);

@@ -20,15 +20,25 @@
 #define MAGIC_OUTPUT_DIR 0x525449525450554fULL /* "OUTPUTDIR" */
 
 /*
- * Output config block — MUST be in the .data section (not .bss)!
- * Zero-initialized globals go to .bss which has no file data,
- * so the injector's marker scan can't find them.
- * Initializing g_outputPath[0]=1 forces it into .data alongside
- * the magic marker, keeping both at known file-to-VA offsets.
+ * Packed config block: magic marker immediately followed by the path.
+ * No padding between them so the injector can find the path at magic+8.
+ * __attribute__((packed)) prevents the compiler from inserting alignment gaps.
  */
-__attribute__((aligned(32))) volatile UINT64 g_outputDirMagic  = MAGIC_OUTPUT_DIR;
-/* First byte = 1, rest = 0 — keeps this in .data, not .bss */
-__attribute__((aligned(32))) volatile char    g_outputPath[MAX_PATH] = {1};
+#pragma pack(push, 1)
+typedef struct {
+    UINT64 magic;
+    char   path[MAX_PATH];
+} OUTPUT_DIR_BLOCK;
+#pragma pack(pop)
+
+static volatile OUTPUT_DIR_BLOCK g_outputBlock = {
+    MAGIC_OUTPUT_DIR,   /* magic — scanner key */
+    {1}                 /* path[0]=1 keeps struct in .data, not .bss */
+};
+
+/* Convenience aliases used throughout the file */
+#define g_outputDirMagic g_outputBlock.magic
+#define g_outputPath     g_outputBlock.path
 
 /*
  * Build a full output path by prepending g_outputPath (if set) to filename.
