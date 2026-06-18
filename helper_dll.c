@@ -26,9 +26,9 @@
  * Initializing g_outputPath[0]=1 forces it into .data alongside
  * the magic marker, keeping both at known file-to-VA offsets.
  */
-__declspec(align(32)) volatile UINT64 g_outputDirMagic  = MAGIC_OUTPUT_DIR;
+__attribute__((aligned(32))) volatile UINT64 g_outputDirMagic  = MAGIC_OUTPUT_DIR;
 /* First byte = 1, rest = 0 — keeps this in .data, not .bss */
-__declspec(align(32)) volatile char    g_outputPath[MAX_PATH] = {1};
+__attribute__((aligned(32))) volatile char    g_outputPath[MAX_PATH] = {1};
 
 /*
  * Build a full output path by prepending g_outputPath (if set) to filename.
@@ -151,6 +151,10 @@ static void UnlinkFromPEB(HMODULE hModule) {
     }
 }
 
+/* Forward declarations for logging helpers used throughout this file */
+static void DebugLog(const char* msg);
+static void DebugLogFmt(const char* fmt, ...) __attribute__((format(printf,1,2)));
+
 #define DECRYPT_GADGET_RVA 0x1E7040
 
 typedef UINT64 (__fastcall *DecryptGadgetFunc)(PVOID address);
@@ -249,9 +253,18 @@ static BOOL DetectXorKey(PVOID moduleBase, DWORD imageSize) {
 
     if (!plainPage || !encPage) return FALSE;
 
-    /* Score the encrypted page raw (should be low for truly encrypted data) */
+    /* Score the encrypted page raw (should be low for truly encrypted data).
+     * Use VirtualQuery to confirm the page is accessible before reading. */
+    MEMORY_BASIC_INFORMATION encMbi;
+    if (!VirtualQuery(encPage, &encMbi, sizeof(encMbi))) return FALSE;
+    if (encMbi.Protect == PAGE_NOACCESS || encMbi.Protect == 0) {
+        DWORD oldProt;
+        if (!VirtualProtect(encPage, 256, PAGE_EXECUTE_READ, &oldProt)) return FALSE;
+        VirtualProtect(encPage, 256, oldProt, &oldProt);
+        if (!VirtualQuery(encPage, &encMbi, sizeof(encMbi))) return FALSE;
+    }
     uint8_t tmp[256];
-    __try { memcpy(tmp, encPage, 256); } __except(EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+    memcpy(tmp, encPage, 256);
     if (ScoreAsCode(tmp, 256) > 40) {
         /* Page looks like code already — no XOR needed */
         return FALSE;
@@ -260,12 +273,14 @@ static BOOL DetectXorKey(PVOID moduleBase, DWORD imageSize) {
     /* Try each 8-byte aligned chunk of the readable page as a candidate key */
     int bestScore = 0;
     UINT64 bestKey = 0;
-    for (int k = 0; k < 64; k++) {
+    int k;
+    for (k = 0; k < 64; k++) {
         UINT64 candidate;
         memcpy(&candidate, plainPage + k * 8, 8);
         if (!candidate) continue;
         uint8_t decoded[256];
-        for (int i = 0; i < 32; i++) {
+        int i;
+        for (i = 0; i < 32; i++) {
             UINT64 enc;
             memcpy(&enc, tmp + i * 8, 8);
             UINT64 dec = enc ^ candidate;
@@ -810,8 +825,6 @@ static void CleanupForcedDecryption(void) {
     }
     DeleteCriticalSection(&g_decryptLock);
 }
-
-static void DebugLog(const char* msg);
 
 static void* g_wowMemcpy = NULL;
 
@@ -2077,6 +2090,15 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
      *   48 8B 09 C3          -- mov rcx,[rcx]; ret   (alternate reg)
      *   48 8B 41 ?? C3       -- mov rax,[rcx+N]; ret (offset variant)
      */
+    /* Read imageSize from PE headers before using it in the gadget scan */
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)moduleBase;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)moduleBase + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
+    snprintf(logBuf, sizeof(logBuf), "Size: %.1f MB", imageSize / 1048576.0);
+    DebugLog(logBuf);
+
     g_decryptGadget = NULL;
     LPBYTE base = (LPBYTE)moduleBase;
 
@@ -2124,17 +2146,7 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     if (g_decryptGadget)
         DebugLogFmt("Base: %p | Gadget: %p", moduleBase, (void*)g_decryptGadget);
     else
-        DebugLogFmt("Base: %p | Gadget: NOT FOUND — dump may be incomplete (encrypted pages won't decrypt)", moduleBase);
-    
-    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)moduleBase;
-    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    
-    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)moduleBase + pDos->e_lfanew);
-    if (pNt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    
-    DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
-    snprintf(logBuf, sizeof(logBuf), "Size: %.1f MB", imageSize / 1048576.0);
-    DebugLog(logBuf);
+        DebugLogFmt("Base: %p | Gadget: NOT FOUND - trying XOR detection", moduleBase);
     
     PVOID dumpBuffer = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!dumpBuffer) {
