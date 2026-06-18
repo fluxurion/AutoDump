@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <string.h>
@@ -1191,7 +1192,7 @@ static void StealthCloseFile(HANDLE hFile) {
 }
 
 static void DebugLog(const char* msg) {
-    HANDLE hFile = CreateFileA(OutputPath("helper_debug.txt"), FILE_APPEND_DATA,
+    HANDLE hFile = CreateFileA(OutputPath("autodump.log"), FILE_APPEND_DATA,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -1200,6 +1201,27 @@ static void DebugLog(const char* msg) {
         WriteFile(hFile, "\r\n", 2, &written, NULL);
         CloseHandle(hFile);
     }
+}
+
+static void DebugLogFmt(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    DebugLog(buf);
+}
+
+static void DebugLogSessionHeader(void) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "\r\n=== AutoDump session %04d-%02d-%02d %02d:%02d:%02d ===",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    DebugLog(buf);
+    DebugLogFmt("OutputPath: %s",
+                (g_outputPath[0] > 1) ? (const char*)g_outputPath : "(not set, using target CWD)");
 }
 
 static int IsValidFuncName(const char* str, int maxLen) {
@@ -1943,7 +1965,7 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     
     PPEB peb = GET_PEB();
     if (!peb || !peb->ImageBaseAddress) {
-        DebugLog("ERR: No PEB");
+        DebugLog("ERR: PEB or ImageBaseAddress is NULL — cannot dump");
         return 0;
     }
     
@@ -1967,8 +1989,10 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         }
     }
     
-    snprintf(logBuf, sizeof(logBuf), "Base: %p | Gadget: %p", moduleBase, (void*)g_decryptGadget);
-    DebugLog(logBuf);
+    if (g_decryptGadget)
+        DebugLogFmt("Base: %p | Gadget: %p", moduleBase, (void*)g_decryptGadget);
+    else
+        DebugLogFmt("Base: %p | Gadget: NOT FOUND — dump may be incomplete (encrypted pages won't decrypt)", moduleBase);
     
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)moduleBase;
     if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
@@ -1981,7 +2005,11 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     DebugLog(logBuf);
     
     PVOID dumpBuffer = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!dumpBuffer) return 0;
+    if (!dumpBuffer) {
+        DebugLogFmt("ERR: VirtualAlloc failed for dump buffer (%.1f MB) — out of memory?",
+                    imageSize / 1048576.0);
+        return 0;
+    }
     
     SpoofedMemcpy(dumpBuffer, moduleBase, pNt->OptionalHeader.SizeOfHeaders);
     
@@ -2142,17 +2170,21 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     
     HANDLE hFile = StealthCreateFile(OutputPath("wow_dump.bin"));
     BOOL useStealth = (hFile != INVALID_HANDLE_VALUE);
-    
+
     if (!useStealth) {
         hFile = CreateFileA(OutputPath("wow_dump.bin"), GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     }
-    
+
     if (hFile == INVALID_HANDLE_VALUE) {
+        DebugLogFmt("ERR: Failed to create wow_dump.bin at '%s' (WinError %lu)",
+                    OutputPath("wow_dump.bin"), GetLastError());
+        DebugLog("ERR: Possible causes: path does not exist, access denied, or disk full");
         SecureZeroBuffer(dumpBuffer, imageSize);
         VirtualFree(dumpBuffer, 0, MEM_RELEASE);
         return 0;
     }
+    DebugLogFmt("wow_dump.bin opened OK (stealth=%d) at: %s", useStealth, OutputPath("wow_dump.bin"));
     
     DWORD written = 0;
     BOOL ok = useStealth ? 
@@ -2235,14 +2267,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
         UnlinkFromPEB(hModule);
         
         char logBuf[64];
+        DebugLogSessionHeader();
         snprintf(logBuf, sizeof(logBuf), "Init: TLS=%d, hidden", g_tlsTracker.count);
         DebugLog(logBuf);
-        
+
         if (!ScheduleDeferredDump()) {
+            DebugLog("ScheduleDeferredDump failed, falling back to inline wait");
             StealthSleep(120000);
             DumpWorkerThread(NULL);
+        } else {
+            DebugLog("ScheduleDeferredDump OK");
         }
-        
+
         return TRUE;
     }
     

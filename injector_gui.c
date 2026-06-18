@@ -458,7 +458,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                 LogMessage("[*] Target process exited. Dump files: %d", lastFileCount);
             } else {
                 LogMessage("[-] Target process terminated before dump completed.");
-                LogMessage("[-] Check helper_debug.txt in the AutoDumped folder for details.");
+                LogMessage("[-] Check autodump.log in the AutoDumped folder for details.");
             }
             break;
         }
@@ -537,7 +537,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                        maxPolls * 500 / 60000);
             LogMessage("[-] Possible causes: anti-cheat blocked injection, insufficient"
                        " privileges, or the dump logic crashed.");
-            LogMessage("[-] Check helper_debug.txt in the AutoDumped folder for details.");
+            LogMessage("[-] Check autodump.log in the AutoDumped folder for details.");
             SetProgress(0);
         }
     }
