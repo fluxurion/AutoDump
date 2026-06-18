@@ -11,15 +11,14 @@
 #include <tlhelp32.h>
 
 #define ID_BTN_BROWSE         1001
-#define ID_BTN_INJECT_RUN     1002
-#define ID_BTN_INJECT_LAUNCH  1003
-#define ID_EDIT_PROCESS       1004
-#define ID_LIST_LOG           1005
-#define ID_STATIC_STATUS      1006
-#define ID_PROGRESS           1007
-#define ID_BTN_OPEN_FOLDER    1008
-#define ID_STATIC_HINT        1009
-#define ID_STATIC_WARN        1010
+#define ID_BTN_INJECT_LAUNCH  1002
+#define ID_EDIT_PROCESS       1003
+#define ID_LIST_LOG           1004
+#define ID_STATIC_STATUS      1005
+#define ID_PROGRESS           1006
+#define ID_BTN_OPEN_FOLDER    1007
+#define ID_STATIC_HINT        1008
+#define ID_STATIC_WARN        1009
 
 /* ── Layout constants ── */
 #define WIN_W     640
@@ -55,8 +54,8 @@
 #define COL_SEL_BG    RGB(40,  50,  80 )  /* selected row bg   */
 
 /* ── Button state tracking for owner-draw ── */
-#define BTN_COUNT 4
-static HWND  g_btns[BTN_COUNT];          /* ordered: run, launch, folder, browse */
+#define BTN_COUNT 3
+static HWND  g_btns[BTN_COUNT];          /* ordered: launch, folder, browse */
 static BOOL  g_btnHover[BTN_COUNT];      /* mouse is over button i */
 static BOOL  g_btnPress[BTN_COUNT];      /* button i is being pressed */
 static COLORREF g_btnColor[BTN_COUNT];   /* base color per button */
@@ -64,7 +63,6 @@ static COLORREF g_btnColor[BTN_COUNT];   /* base color per button */
 static HWND g_hWnd           = NULL;
 static HWND g_hEditProcess;
 static HWND g_hListLog;
-static HWND g_hBtnInjectRun;
 static HWND g_hBtnInjectLaunch;
 static HWND g_hBtnBrowse;
 static HWND g_hBtnOpenFolder;
@@ -173,8 +171,6 @@ static int FileExists(const char* path) {
 
 /* ── Worker thread for injection ── */
 static DWORD WINAPI WorkerThread(LPVOID lpParam) {
-    int mode = (int)(INT_PTR)lpParam; /* 0 = running process, 1 = launch */
-
     /* Tell main thread to disable controls and show progress */
     PostMessageA(g_hWnd, WM_INJECT_START, 0, 0);
     SetProgress(0);
@@ -202,65 +198,34 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         return 0;
     }
 
-    /* Build the command line */
-    char cmd[MAX_PATH * 2];
-    if (mode == 0) {
-        /* Inject into a running process */
-        LogMessage("[*] Looking for process '%s' ...", processName);
-        DWORD pid = 0;
-        for (int tries = 0; tries < 300 && pid == 0; tries++) {
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (snap != INVALID_HANDLE_VALUE) {
-                PROCESSENTRY32 pe = {0};
-                pe.dwSize = sizeof(pe);
-                if (Process32First(snap, &pe)) {
-                    do {
-                        if (_stricmp(pe.szExeFile, processName) == 0) {
-                            pid = pe.th32ProcessID;
-                            break;
-                        }
-                    } while (Process32Next(snap, &pe));
-                }
-                CloseHandle(snap);
-            }
-            if (pid == 0) Sleep(10);
-        }
-        if (pid == 0) {
-            LogMessage("[-] Process '%s' not found.", processName);
-            PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
-            return 0;
-        }
-        LogMessage("[*] Found PID %lu", pid);
-        SetProgress(20);
-        snprintf(cmd, sizeof(cmd), "%sinjector.exe %s", myDir, processName);
-    } else {
-        /* Launch & Inject mode: GUI launches the target, injector just injects */
-        LogMessage("[*] Launching '%s' ...", processName);
+    /* Launch & Inject mode: GUI launches the target, injector just injects */
+    LogMessage("[*] Launching '%s' ...", processName);
 
-        STARTUPINFOA siTarget = {0};
-        siTarget.cb = sizeof(siTarget);
-        PROCESS_INFORMATION piTarget = {0};
+    STARTUPINFOA siTarget = {0};
+    siTarget.cb = sizeof(siTarget);
+    PROCESS_INFORMATION piTarget = {0};
 
-        if (!CreateProcessA(NULL, processName, NULL, NULL, FALSE,
-                            0, NULL, NULL, &siTarget, &piTarget)) {
-            LogMessage("[-] Failed to launch target (error %lu)", GetLastError());
-            PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
-            return 0;
-        }
-        CloseHandle(piTarget.hThread);
-        CloseHandle(piTarget.hProcess);
-
-        /* Extract just the filename so injector.exe can find it by name */
-        const char* justName = strrchr(processName, '\\');
-        if (justName)
-            justName++; /* skip the backslash */
-        else
-            justName = processName;
-
-        LogMessage("[*] Target launched, injecting into '%s' ...", justName);
-        SetProgress(20);
-        snprintf(cmd, sizeof(cmd), "%sinjector.exe %s", myDir, justName);
+    if (!CreateProcessA(NULL, processName, NULL, NULL, FALSE,
+                        0, NULL, NULL, &siTarget, &piTarget)) {
+        LogMessage("[-] Failed to launch target (error %lu)", GetLastError());
+        PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
+        return 0;
     }
+    CloseHandle(piTarget.hThread);
+    CloseHandle(piTarget.hProcess);
+
+    /* Extract just the filename so injector.exe can find it by name */
+    const char* justName = strrchr(processName, '\\');
+    if (justName)
+        justName++; /* skip the backslash */
+    else
+        justName = processName;
+
+    LogMessage("[*] Target launched, injecting into '%s' ...", justName);
+    SetProgress(20);
+
+    char cmd[MAX_PATH * 2];
+    snprintf(cmd, sizeof(cmd), "%sinjector.exe %s", myDir, justName);
 
     LogMessage("[*] Running: %s", cmd);
 
@@ -386,20 +351,14 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
     {
         char targetDir[MAX_PATH] = {0};
-        if (mode == 1) {
-            /* Launch mode: processName may be a full path — extract the directory */
-            const char* slash = strrchr(processName, '\\');
-            if (slash) {
-                SIZE_T dirLen = (slash - processName) + 1;
-                if (dirLen < MAX_PATH) {
-                    memcpy(targetDir, processName, dirLen);
-                    targetDir[dirLen] = 0;
-                }
-            } else {
-                GetTargetProcessDir(processName, targetDir, sizeof(targetDir));
+        /* processName is the full path from the browse dialog — extract directory */
+        const char* slash = strrchr(processName, '\\');
+        if (slash) {
+            SIZE_T dirLen = (slash - processName) + 1;
+            if (dirLen < MAX_PATH) {
+                memcpy(targetDir, processName, dirLen);
+                targetDir[dirLen] = 0;
             }
-        } else {
-            GetTargetProcessDir(processName, targetDir, sizeof(targetDir));
         }
         if (targetDir[0]) {
             snprintf(pollDirs[0], sizeof(pollDirs[0]), "%sAutoDumped\\", targetDir);
@@ -423,10 +382,6 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     int lastFileCount = 0;
     int stableCount  = 0; /* consecutive polls with same count */
     int lastLoggedSec = -1; /* prevent duplicate interval messages */
-
-    /* Resolve the target process name for liveness checks */
-    const char* justName = strrchr(processName, '\\');
-    if (justName) justName++; else justName = processName;
 
     while (pollCount < maxPolls) {
         int count = 0;
@@ -550,7 +505,6 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
 /* ── Enable/disable controls (main thread only!) ── */
 static void SetUIControls(BOOL enable) {
-    EnableWindow(g_hBtnInjectRun,    enable);
     EnableWindow(g_hBtnInjectLaunch, enable);
     EnableWindow(g_hBtnBrowse,       enable);
     EnableWindow(g_hBtnOpenFolder,   enable);
@@ -578,16 +532,16 @@ static void OnBrowse(HWND hWnd) {
     }
 }
 
-static void StartInjection(int mode) {
+static void StartInjection(void) {
     if (g_injectRunning) return;
     char buf[MAX_PATH] = {0};
     GetWindowTextA(g_hEditProcess, buf, sizeof(buf));
     if (buf[0] == 0) {
-        LogMessage("[-] Enter a process name or select an .exe first.");
+        LogMessage("[-] Select an .exe first.");
         return;
     }
     g_injectRunning = 1;
-    CloseHandle(CreateThread(NULL, 0, WorkerThread, (LPVOID)(INT_PTR)mode, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL));
 }
 
 /* ── Owner-draw button helper ── */
@@ -708,10 +662,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             /* ── Action buttons row ── */
             int bw = 150, bh = 32, bx = MARGIN;
-            g_hBtnInjectRun = CreateWindowA("BUTTON", "Inject into Running",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_INJECT_RUN, hInst, NULL);
-            bx += bw + 8;
             g_hBtnInjectLaunch = CreateWindowA("BUTTON", "Launch && Inject",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_INJECT_LAUNCH, hInst, NULL);
@@ -721,10 +671,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_OPEN_FOLDER, hInst, NULL);
 
             /* Register buttons for subclassing + set colors */
-            g_btns[0] = g_hBtnInjectRun;    g_btnColor[0] = COL_BTN_RUN;
-            g_btns[1] = g_hBtnInjectLaunch; g_btnColor[1] = COL_BTN_LAUNCH;
-            g_btns[2] = g_hBtnOpenFolder;   g_btnColor[2] = COL_BTN_FOLD;
-            g_btns[3] = g_hBtnBrowse;       g_btnColor[3] = COL_BTN_BROW;
+            g_btns[0] = g_hBtnInjectLaunch; g_btnColor[0] = COL_BTN_LAUNCH;
+            g_btns[1] = g_hBtnOpenFolder;   g_btnColor[1] = COL_BTN_FOLD;
+            g_btns[2] = g_hBtnBrowse;       g_btnColor[2] = COL_BTN_BROW;
             for (int i = 0; i < BTN_COUNT; i++) {
                 g_btnHover[i] = FALSE; g_btnPress[i] = FALSE;
                 g_btnOrigProc[i] = (WNDPROC)SetWindowLongPtrA(
@@ -869,8 +818,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
                 case ID_BTN_BROWSE:       OnBrowse(hWnd); break;
-                case ID_BTN_INJECT_RUN:   StartInjection(0); break;
-                case ID_BTN_INJECT_LAUNCH: StartInjection(1); break;
+                case ID_BTN_INJECT_LAUNCH: StartInjection(); break;
                 case ID_BTN_OPEN_FOLDER: {
                     char openDir[MAX_PATH] = {0};
 
@@ -993,10 +941,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 return TRUE;
             }
-            if (dis->CtlID == ID_BTN_INJECT_RUN)    { DrawOwnedButton(dis, 0); return TRUE; }
-            if (dis->CtlID == ID_BTN_INJECT_LAUNCH)  { DrawOwnedButton(dis, 1); return TRUE; }
-            if (dis->CtlID == ID_BTN_OPEN_FOLDER)    { DrawOwnedButton(dis, 2); return TRUE; }
-            if (dis->CtlID == ID_BTN_BROWSE)         { DrawOwnedButton(dis, 3); return TRUE; }
+            if (dis->CtlID == ID_BTN_INJECT_LAUNCH)  { DrawOwnedButton(dis, 0); return TRUE; }
+            if (dis->CtlID == ID_BTN_OPEN_FOLDER)    { DrawOwnedButton(dis, 1); return TRUE; }
+            if (dis->CtlID == ID_BTN_BROWSE)         { DrawOwnedButton(dis, 2); return TRUE; }
             break;
         }
     }
