@@ -18,6 +18,8 @@
 #define ID_STATIC_STATUS      1006
 #define ID_PROGRESS           1007
 #define ID_BTN_OPEN_FOLDER    1008
+#define ID_STATIC_HINT        1009
+#define ID_STATIC_WARN        1010
 
 static HWND g_hWnd           = NULL; /* main window handle */
 static HWND g_hEditProcess;
@@ -28,14 +30,18 @@ static HWND g_hBtnBrowse;
 static HWND g_hBtnOpenFolder;
 static HWND g_hStaticStatus;
 static HWND g_hProgress;
+static HWND g_hStaticHint;
+static HWND g_hStaticWarn;
+static HBRUSH g_hBrushWarn = NULL; /* orange background for warning banner */
 static char g_selectedExe[MAX_PATH] = {0};
 static volatile int g_injectRunning = 0;
 static HANDLE g_injectorProcess = NULL; /* handle to the running injector.exe */
 
 /* Custom messages from worker -> main thread */
-#define WM_INJECT_LOG     (WM_APP + 1)
-#define WM_INJECT_START   (WM_APP + 2)
-#define WM_INJECT_DONE    (WM_APP + 3)
+#define WM_INJECT_LOG      (WM_APP + 1)
+#define WM_INJECT_START    (WM_APP + 2)
+#define WM_INJECT_DONE     (WM_APP + 3)
+#define WM_INJECT_PROGRESS (WM_APP + 4)  /* wParam = 0-100 */
 
 /* ── Log a message (thread-safe, posts to main thread) ── */
 static void LogMessage(const char* fmt, ...) {
@@ -52,6 +58,11 @@ static void LogMessage(const char* fmt, ...) {
         /* Post to main window so WndProc handles WM_INJECT_LOG */
         PostMessageA(g_hWnd, WM_INJECT_LOG, 0, (LPARAM)msg);
     }
+}
+
+/* ── Update the progress bar (thread-safe) ── */
+static void SetProgress(int pct) {
+    PostMessageA(g_hWnd, WM_INJECT_PROGRESS, (WPARAM)pct, 0);
 }
 
 /* ── Get the directory containing our executable ── */
@@ -120,6 +131,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
     /* Tell main thread to disable controls and show progress */
     PostMessageA(g_hWnd, WM_INJECT_START, 0, 0);
+    SetProgress(0);
 
     char processName[MAX_PATH] = {0};
     GetWindowTextA(g_hEditProcess, processName, sizeof(processName));
@@ -129,6 +141,8 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
         return 0;
     }
+
+    SetProgress(5);
 
     char myDir[MAX_PATH];
     GetMyDir(myDir, sizeof(myDir));
@@ -171,6 +185,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             return 0;
         }
         LogMessage("[*] Found PID %lu", pid);
+        SetProgress(20);
         snprintf(cmd, sizeof(cmd), "%sinjector.exe %s", myDir, processName);
     } else {
         /* Launch & Inject mode: GUI launches the target, injector just injects */
@@ -197,6 +212,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             justName = processName;
 
         LogMessage("[*] Target launched, injecting into '%s' ...", justName);
+        SetProgress(20);
         snprintf(cmd, sizeof(cmd), "%sinjector.exe %s", myDir, justName);
     }
 
@@ -307,8 +323,10 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     LogMessage("[*] Injector exited with code %lu", exitCode);
     if (exitCode == 0) {
         LogMessage("[+] Injection complete. Dump running in target process (~2 min).");
+        SetProgress(50);
     } else {
         LogMessage("[-] Injection failed (exit code %lu) — cannot dump.", exitCode);
+        SetProgress(0);
         PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
         return 0;
     }
@@ -365,6 +383,13 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
     while (pollCount < maxPolls) {
         int count = 0;
+
+        /* Advance progress bar gradually from 50 toward 95 while waiting */
+        {
+            int p = 50 + (pollCount * 45) / maxPolls;
+            if (p > 95) p = 95;
+            SetProgress(p);
+        }
 
         /* Check if target process is still alive */
         DWORD targetPid = 0;
@@ -423,6 +448,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             stableCount++;
             if (stableCount >= 6) {  /* 6 * 500ms = 3 seconds stable = complete */
                 LogMessage("[+] Dump complete! (%d files)", count);
+                SetProgress(100);
                 break;
             }
         }
@@ -459,12 +485,14 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         if (lastFileCount > 0) {
             LogMessage("[+] Dump polling ended. %d file(s) written to: %s",
                        lastFileCount, numPollDirs > 0 ? pollDirs[0] : "unknown");
+            SetProgress(100);
         } else {
             LogMessage("[-] Dump timed out after %d min — no files found.",
                        maxPolls * 500 / 60000);
             LogMessage("[-] Possible causes: anti-cheat blocked injection, insufficient"
                        " privileges, or the dump logic crashed.");
             LogMessage("[-] Check helper_debug.txt in the AutoDumped folder for details.");
+            SetProgress(0);
         }
     }
 
@@ -482,7 +510,9 @@ static void SetUIControls(BOOL enable) {
     EnableWindow(g_hBtnInjectLaunch, enable);
     EnableWindow(g_hBtnBrowse, enable);
     EnableWindow(g_hBtnOpenFolder, enable);
-    ShowWindow(g_hProgress, enable ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_hProgress,   enable ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_hStaticHint, enable ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_hStaticWarn, enable ? SW_HIDE : SW_SHOW);
 }
 
 /* ── Button handlers ── */
@@ -567,12 +597,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                                              280, 45, 120, 30,
                                              hWnd, (HMENU)ID_BTN_OPEN_FOLDER, NULL, NULL);
 
-            /* Marquee progress bar (hidden until injection starts) */
+            /* Progress bar (hidden until injection starts) */
             g_hProgress = CreateWindowExA(0, PROGRESS_CLASSA, "",
-                                          WS_CHILD | PBS_MARQUEE,
+                                          WS_CHILD | PBS_SMOOTH,
                                           405, 49, 130, 22,
                                           hWnd, (HMENU)ID_PROGRESS, NULL, NULL);
-            SendMessage(g_hProgress, PBM_SETMARQUEE, (WPARAM)TRUE, 0);
+            SendMessage(g_hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+            SendMessage(g_hProgress, PBM_SETPOS, 0, 0);
             ShowWindow(g_hProgress, SW_HIDE);
 
             g_hStaticStatus = CreateWindowA("STATIC", "Ready.",
@@ -581,12 +612,35 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                                             hWnd, (HMENU)ID_STATIC_STATUS, NULL, NULL);
             if (hFont) SendMessage(g_hStaticStatus, WM_SETFONT, (WPARAM)hFont, 0);
 
+            /* Step-by-step instructions — visible on startup, hidden while running */
+            g_hStaticHint = CreateWindowA("STATIC",
+                                          "How to use:  "
+                                          "1. Browse for the target .exe  "
+                                          "2. Click \"Launch & Inject\" (or \"Inject into Running\")  "
+                                          "3. Wait for the dump to finish  "
+                                          "4. Click \"Open Dump Folder\" to view results",
+                                          WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                          10, 112, 530, 32,
+                                          hWnd, (HMENU)ID_STATIC_HINT, NULL, NULL);
+            if (hFont) SendMessage(g_hStaticHint, WM_SETFONT, (WPARAM)hFont, 0);
+
+            /* Warning banner — hidden on startup, shown while injection/dump is running */
+            g_hStaticWarn = CreateWindowA("STATIC",
+                                          "  (!!)  Do NOT close the target process until the dump is complete!",
+                                          WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
+                                          10, 112, 530, 32,
+                                          hWnd, (HMENU)ID_STATIC_WARN, NULL, NULL);
+            if (hFont) SendMessage(g_hStaticWarn, WM_SETFONT, (WPARAM)hFont, 0);
+            g_hBrushWarn = CreateSolidBrush(RGB(180, 80, 0));
+
             g_hListLog = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
                                          WS_CHILD | WS_VISIBLE | LBS_NOINTEGRALHEIGHT |
+                                         LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
                                          WS_VSCROLL | WS_HSCROLL,
-                                         10, 115, 530, 220,
+                                         10, 152, 530, 240,
                                          hWnd, (HMENU)ID_LIST_LOG, NULL, NULL);
             if (hFont) SendMessage(g_hListLog, WM_SETFONT, (WPARAM)hFont, 0);
+            SendMessageA(g_hListLog, LB_SETITEMHEIGHT, 0, 16);
 
             LogMessage("[*] Ready. Enter a process name or browse for an .exe.");
             return 0;
@@ -605,8 +659,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_INJECT_PROGRESS:
+            SendMessage(g_hProgress, PBM_SETPOS, wParam, 0);
+            return 0;
+
         case WM_INJECT_START:
             SetUIControls(FALSE);
+            SendMessage(g_hProgress, PBM_SETPOS, 0, 0);
             SetWindowTextA(g_hStaticStatus, "Injecting ...");
             return 0;
 
@@ -650,12 +709,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             /* Clean up brushes */
             if (g_hBrushDark)     DeleteObject(g_hBrushDark);
             if (g_hBrushDarkEdit) DeleteObject(g_hBrushDarkEdit);
+            if (g_hBrushWarn)     DeleteObject(g_hBrushWarn);
             PostQuitMessage(0);
             return 0;
 
         /* ── Dark mode background colors using pre-created brushes ── */
         case WM_CTLCOLORSTATIC: {
             HDC hdc = (HDC)wParam;
+            HWND hCtrl = (HWND)lParam;
+            if (hCtrl == g_hStaticWarn) {
+                SetBkColor(hdc, RGB(180, 80, 0));
+                SetTextColor(hdc, RGB(255, 230, 180));
+                return (LRESULT)g_hBrushWarn;
+            }
             SetBkColor(hdc, RGB(30, 30, 30));
             SetTextColor(hdc, RGB(200, 200, 200));
             return (LRESULT)g_hBrushDark;
@@ -668,9 +734,53 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_CTLCOLORLISTBOX: {
             HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, RGB(25, 25, 25));
-            SetTextColor(hdc, RGB(180, 220, 180));
+            SetBkColor(hdc, RGB(20, 20, 20));
+            SetTextColor(hdc, RGB(200, 200, 200));
             return (LRESULT)g_hBrushDarkEdit;
+        }
+
+        case WM_MEASUREITEM: {
+            MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lParam;
+            if (mis->CtlID == ID_LIST_LOG)
+                mis->itemHeight = 16;
+            return TRUE;
+        }
+
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+            if (dis->CtlID != ID_LIST_LOG) break;
+            if (dis->itemID == (UINT)-1) break;
+
+            char text[1024] = {0};
+            SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)text);
+
+            /* Choose text color by prefix */
+            COLORREF fg;
+            if (text[0] == '[' && text[1] == '+') {
+                fg = RGB(100, 220, 100);  /* green  — success */
+            } else if (text[0] == '[' && text[1] == '-') {
+                fg = RGB(220, 80, 80);    /* red    — error   */
+            } else if (strncmp(text, "[injector]", 10) == 0) {
+                fg = RGB(140, 180, 220);  /* blue   — injector output */
+            } else {
+                fg = RGB(190, 190, 190);  /* gray   — info    */
+            }
+
+            /* Background */
+            COLORREF bg = (dis->itemState & ODS_SELECTED)
+                          ? RGB(50, 50, 70) : RGB(20, 20, 20);
+            HBRUSH hbr = CreateSolidBrush(bg);
+            FillRect(dis->hDC, &dis->rcItem, hbr);
+            DeleteObject(hbr);
+
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, fg);
+
+            RECT rc = dis->rcItem;
+            rc.left += 4;
+            DrawTextA(dis->hDC, text, -1, &rc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
         }
     }
     return DefWindowProcA(hWnd, msg, wParam, lParam);
@@ -704,7 +814,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                 WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT,
-                                570, 380, NULL, NULL, hInstance, NULL);
+                                570, 440, NULL, NULL, hInstance, NULL);
     if (!hWnd) {
         MessageBoxA(NULL, "Failed to create window.", "Error", MB_ICONERROR);
         return 1;
