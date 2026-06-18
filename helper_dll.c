@@ -156,6 +156,10 @@ static void UnlinkFromPEB(HMODULE hModule) {
 typedef UINT64 (__fastcall *DecryptGadgetFunc)(PVOID address);
 static DecryptGadgetFunc g_decryptGadget = NULL;
 
+/* Global XOR key discovered at runtime (0 = none detected) */
+static UINT64 g_xorKey   = 0;
+static BOOL   g_xorReady = FALSE;
+
 static volatile BOOL g_pageCopyFailed = FALSE;
 
 static LONG CALLBACK PageCopyVEH(PEXCEPTION_POINTERS ep) {
@@ -168,14 +172,10 @@ static LONG CALLBACK PageCopyVEH(PEXCEPTION_POINTERS ep) {
 
 static BOOL DecryptPageWithGadget(PVOID srcPage, PVOID dstBuffer) {
     if (!g_decryptGadget) return FALSE;
-    
     UINT64* src = (UINT64*)srcPage;
     UINT64* dst = (UINT64*)dstBuffer;
-    
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i < 512; i++)
         dst[i] = g_decryptGadget(&src[i]);
-    }
-    
     return TRUE;
 }
 
@@ -184,14 +184,111 @@ static BOOL CopyPageAfterTouch(PVOID srcPage, PVOID dstBuffer) {
         memcpy(dstBuffer, srcPage, 4096);
         return TRUE;
     }
-    
     UINT64* src = (UINT64*)srcPage;
     UINT64* dst = (UINT64*)dstBuffer;
-    
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i < 512; i++)
         dst[i] = g_decryptGadget(&src[i]);
+    return TRUE;
+}
+
+/*
+ * XOR key detection: sample accessible code pages looking for a repeating
+ * 8-byte XOR key. A valid key is one where XORing a readable page produces
+ * output that looks like x86-64 code (high density of common instruction
+ * prefixes: 0x48/0x4C/0x41/0x45/0x40, 0xE8, 0xFF, 0x8B, 0x89, 0x0F).
+ */
+static int ScoreAsCode(const uint8_t* buf, DWORD len) {
+    int score = 0;
+    for (DWORD i = 0; i < len && i < 256; i++) {
+        uint8_t b = buf[i];
+        if (b == 0x48 || b == 0x4C || b == 0x41 || b == 0x45 || b == 0x40 ||
+            b == 0xE8 || b == 0xFF || b == 0x8B || b == 0x89 || b == 0x0F ||
+            b == 0x55 || b == 0x53 || b == 0x56 || b == 0x57 || b == 0xC3)
+            score++;
     }
-    
+    return score;
+}
+
+/*
+ * Try to derive the XOR key by looking at a readable code page that is
+ * immediately adjacent to a PAGE_NOACCESS page. We XOR candidate 8-byte
+ * keys (sampled from the readable page itself at aligned offsets) against
+ * the first 256 bytes of the protected page and score the result.
+ */
+static BOOL DetectXorKey(PVOID moduleBase, DWORD imageSize) {
+    if (g_xorReady) return g_xorKey != 0;
+    g_xorReady = TRUE;
+
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)moduleBase;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)moduleBase + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    /* Find first readable code section page to use as plaintext reference */
+    uint8_t* plainPage = NULL;
+    uint8_t* encPage   = NULL;
+
+    for (WORD s = 0; s < pNt->FileHeader.NumberOfSections && !encPage; s++) {
+        if (!(pSec[s].Characteristics & IMAGE_SCN_CNT_CODE)) continue;
+        DWORD secRVA  = pSec[s].VirtualAddress;
+        DWORD secSize = pSec[s].Misc.VirtualSize;
+        if (!secSize) secSize = pSec[s].SizeOfRawData;
+
+        for (DWORD off = 0; off + 8192 < secSize; off += 4096) {
+            uint8_t* pg1 = (uint8_t*)moduleBase + secRVA + off;
+            uint8_t* pg2 = (uint8_t*)moduleBase + secRVA + off + 4096;
+            MEMORY_BASIC_INFORMATION m1, m2;
+            if (!VirtualQuery(pg1, &m1, sizeof(m1))) continue;
+            if (!VirtualQuery(pg2, &m2, sizeof(m2))) continue;
+            BOOL r1 = (m1.Protect & PAGE_EXECUTE_READ) || (m1.Protect & PAGE_EXECUTE_READWRITE) ||
+                      (m1.Protect & PAGE_READONLY)     || (m1.Protect & PAGE_READWRITE);
+            BOOL r2 = (m2.Protect == PAGE_NOACCESS || m2.Protect == 0);
+            if (r1 && r2) { plainPage = pg1; encPage = pg2; break; }
+        }
+    }
+
+    if (!plainPage || !encPage) return FALSE;
+
+    /* Score the encrypted page raw (should be low for truly encrypted data) */
+    uint8_t tmp[256];
+    __try { memcpy(tmp, encPage, 256); } __except(EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+    if (ScoreAsCode(tmp, 256) > 40) {
+        /* Page looks like code already — no XOR needed */
+        return FALSE;
+    }
+
+    /* Try each 8-byte aligned chunk of the readable page as a candidate key */
+    int bestScore = 0;
+    UINT64 bestKey = 0;
+    for (int k = 0; k < 64; k++) {
+        UINT64 candidate;
+        memcpy(&candidate, plainPage + k * 8, 8);
+        if (!candidate) continue;
+        uint8_t decoded[256];
+        for (int i = 0; i < 32; i++) {
+            UINT64 enc;
+            memcpy(&enc, tmp + i * 8, 8);
+            UINT64 dec = enc ^ candidate;
+            memcpy(decoded + i * 8, &dec, 8);
+        }
+        int sc = ScoreAsCode(decoded, 256);
+        if (sc > bestScore) { bestScore = sc; bestKey = candidate; }
+    }
+
+    if (bestScore >= 20 && bestKey) {
+        g_xorKey = bestKey;
+        DebugLogFmt("XOR key detected: 0x%016llX (score=%d)", (unsigned long long)bestKey, bestScore);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL TryXorDecryptPage(PVOID srcPage, PVOID dstBuffer) {
+    if (!g_xorKey) return FALSE;
+    UINT64* src = (UINT64*)srcPage;
+    UINT64* dst = (UINT64*)dstBuffer;
+    for (int i = 0; i < 512; i++)
+        dst[i] = src[i] ^ g_xorKey;
     return TRUE;
 }
 
@@ -1972,21 +2069,56 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     PVOID moduleBase = peb->ImageBaseAddress;
     InitSpoofedCall(moduleBase);
     
-    LPBYTE gadgetBytes = (LPBYTE)moduleBase + DECRYPT_GADGET_RVA;
-    if (gadgetBytes[0] == 0x48 && gadgetBytes[1] == 0x8B && 
-        gadgetBytes[2] == 0x01 && gadgetBytes[3] == 0xC3) {
-        g_decryptGadget = (DecryptGadgetFunc)gadgetBytes;
-    } else {
-        g_decryptGadget = NULL;
-        for (DWORD offset = 0x1000; offset < 0x1000000; offset++) {
-            LPBYTE p = (LPBYTE)moduleBase + offset;
-            if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x01 && p[3] == 0xC3) {
-                if (p[-1] == 0xCC || p[4] == 0xCC) {
-                    g_decryptGadget = (DecryptGadgetFunc)p;
-                    break;
-                }
-            }
+    /*
+     * Gadget scan: try hardcoded RVA first, then scan .text for known
+     * WoW encryption gadget byte patterns:
+     *   48 8B 01 C3          -- mov rax,[rcx]; ret   (classic)
+     *   48 8B 01 48 31 ?? C3 -- mov rax,[rcx]; xor ..; ret  (XOR variant)
+     *   48 8B 09 C3          -- mov rcx,[rcx]; ret   (alternate reg)
+     *   48 8B 41 ?? C3       -- mov rax,[rcx+N]; ret (offset variant)
+     */
+    g_decryptGadget = NULL;
+    LPBYTE base = (LPBYTE)moduleBase;
+
+    /* 1. Try hardcoded RVA for the known build */
+    {
+        LPBYTE p = base + DECRYPT_GADGET_RVA;
+        if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x01 && p[3] == 0xC3)
+            g_decryptGadget = (DecryptGadgetFunc)p;
+    }
+
+    /* 2. Scan up to 16 MB for any matching gadget pattern */
+    DWORD scanLimit = imageSize < 0x1000000 ? imageSize : 0x1000000;
+    for (DWORD offset = 0x1000; offset < scanLimit - 8 && !g_decryptGadget; offset++) {
+        LPBYTE p = base + offset;
+        MEMORY_BASIC_INFORMATION _mbi;
+        /* Only scan readable pages */
+        if ((offset & 0xFFF) == 0) {
+            if (!VirtualQuery(p, &_mbi, sizeof(_mbi))) { offset += 0xFFF; continue; }
+            if (!(_mbi.Protect & (PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_READONLY|PAGE_READWRITE)))
+                { offset += 0xFFF; continue; }
         }
+        /* Pattern A: 48 8B 01 C3 */
+        if (p[0]==0x48 && p[1]==0x8B && p[2]==0x01 && p[3]==0xC3)
+            if (p[-1]==0xCC || p[-1]==0xC3 || p[-1]==0x90 || p[4]==0xCC)
+                { g_decryptGadget = (DecryptGadgetFunc)p; break; }
+        /* Pattern B: 48 8B 01 48 31 ?? C3 (XOR variant) */
+        if (p[0]==0x48 && p[1]==0x8B && p[2]==0x01 &&
+            p[3]==0x48 && p[4]==0x31 && p[6]==0xC3)
+            { g_decryptGadget = (DecryptGadgetFunc)p; break; }
+        /* Pattern C: 48 8B 09 C3 */
+        if (p[0]==0x48 && p[1]==0x8B && p[2]==0x09 && p[3]==0xC3)
+            if (p[-1]==0xCC || p[-1]==0xC3 || p[4]==0xCC)
+                { g_decryptGadget = (DecryptGadgetFunc)p; break; }
+        /* Pattern D: 48 8B 41 ?? C3 */
+        if (p[0]==0x48 && p[1]==0x8B && p[2]==0x41 && p[4]==0xC3)
+            if (p[-1]==0xCC || p[-1]==0xC3 || p[5]==0xCC)
+                { g_decryptGadget = (DecryptGadgetFunc)p; break; }
+    }
+
+    /* 3. If no gadget found, attempt XOR key detection */
+    if (!g_decryptGadget) {
+        DetectXorKey(moduleBase, imageSize);
     }
     
     if (g_decryptGadget)
@@ -2032,63 +2164,86 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         BOOL isCodeSection = (pSec->Characteristics & IMAGE_SCN_CNT_CODE) || 
                              (secName[0] == '.' && secName[1] == 't' && secName[2] == 'e');
         
+        DWORD pagesGadget = 0, pagesXor = 0, pagesPlain = 0;
+
         for (DWORD offset = 0; offset < secSize; offset += pageSize) {
             DWORD copySize = (offset + pageSize > secSize) ? (secSize - offset) : pageSize;
             PVOID srcPage = (LPBYTE)moduleBase + secRVA + offset;
             PVOID dstPage = (LPBYTE)dumpBuffer + secRVA + offset;
-            
+
             MEMORY_BASIC_INFORMATION mbi;
             if (VirtualQuery(srcPage, &mbi, sizeof(mbi)) == 0) continue;
-            
-            if (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0) {
-                BOOL decrypted = FALSE;
-                
-                if (isCodeSection && copySize == pageSize && CopyPageAfterTouch(srcPage, dstPage)) {
-                    decrypted = TRUE;
-                    pagesForceDecrypted++;
-                    pagesCopied++;
-                }
-                
-                if (!decrypted && isCodeSection && g_decryptGadget && copySize == pageSize) {
+
+            BOOL needsDecrypt = (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0);
+            BOOL accessible   = !needsDecrypt && !(mbi.Protect & PAGE_GUARD);
+            BOOL done = FALSE;
+
+            if (needsDecrypt && isCodeSection && copySize == pageSize) {
+                /* Strategy 1: gadget-based decryption */
+                if (!done && g_decryptGadget) {
                     DWORD oldProt;
                     if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
                         if (DecryptPageWithGadget(srcPage, dstPage)) {
-                            decrypted = TRUE;
-                            pagesForceDecrypted++;
-                            pagesCopied++;
+                            pagesGadget++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
                         }
                         VirtualProtect(srcPage, copySize, oldProt, &oldProt);
                     }
                 }
-                
-                if (!decrypted) {
+                /* Strategy 2: XOR key decryption */
+                if (!done && g_xorKey) {
+                    DWORD oldProt;
+                    if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
+                        if (TryXorDecryptPage(srcPage, dstPage)) {
+                            pagesXor++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
+                        }
+                        VirtualProtect(srcPage, copySize, oldProt, &oldProt);
+                    }
+                }
+                /* Strategy 3: force-touch then copy */
+                if (!done && CopyPageAfterTouch(srcPage, dstPage)) {
+                    pagesPlain++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
+                }
+                /* Last resort: force page readable and raw copy */
+                if (!done) {
                     DWORD oldProt;
                     if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
                         SpoofedMemcpy(dstPage, srcPage, copySize);
                         VirtualProtect(srcPage, copySize, oldProt, &oldProt);
-                        pagesCopied++;
+                        pagesPlain++; pagesCopied++;
                     }
                 }
-            } else if (!(mbi.Protect & PAGE_GUARD)) {
-                if (isCodeSection && copySize == pageSize && CopyPageAfterTouch(srcPage, dstPage)) {
-                    pagesForceDecrypted++;
-                    pagesCopied++;
+            } else if (accessible) {
+                /* Page is already readable */
+                if (isCodeSection && copySize == pageSize && g_decryptGadget) {
+                    if (DecryptPageWithGadget(srcPage, dstPage))
+                        { pagesGadget++; pagesForceDecrypted++; pagesCopied++; }
+                    else
+                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; pagesCopied++; }
+                } else if (isCodeSection && copySize == pageSize && g_xorKey) {
+                    if (TryXorDecryptPage(srcPage, dstPage))
+                        { pagesXor++; pagesForceDecrypted++; pagesCopied++; }
+                    else
+                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; pagesCopied++; }
                 } else {
                     SpoofedMemcpy(dstPage, srcPage, copySize);
-                    pagesCopied++;
+                    pagesPlain++; pagesCopied++;
                 }
             }
-            
+
             if ((offset / pageSize) % 100 == 0) StealthSleep(0);
         }
-        
+
+        if (isCodeSection && (pagesGadget || pagesXor || pagesForceDecrypted))
+            DebugLogFmt("  Section %s: gadget=%lu xor=%lu plain=%lu",
+                        secName, pagesGadget, pagesXor, pagesPlain);
+
         totalDecrypted += pagesForceDecrypted;
         totalCopied += pagesCopied;
     }
-    
-    snprintf(logBuf, sizeof(logBuf), "Sections: %d | Pages: %lu copied, %lu decrypted", 
-             numSections, totalCopied, totalDecrypted);
-    DebugLog(logBuf);
+
+    DebugLogFmt("Sections: %d | Pages: %lu copied, %lu decrypted | Method: %s",
+                numSections, totalCopied, totalDecrypted,
+                g_decryptGadget ? "gadget" : (g_xorKey ? "xor" : "plain"));
     
     CleanupForcedDecryption();
     

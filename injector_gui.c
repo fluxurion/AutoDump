@@ -371,7 +371,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         LogMessage("[+] Injection complete. Dump running in target process (~2 min).");
         SetProgress(50);
     } else {
-        LogMessage("[-] Injection failed (exit code %lu) — cannot dump.", exitCode);
+        LogMessage("[-] Injection failed (exit code %lu) - cannot dump.", exitCode);
         SetProgress(0);
         PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
         return 0;
@@ -533,7 +533,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                        lastFileCount, numPollDirs > 0 ? pollDirs[0] : "unknown");
             SetProgress(100);
         } else {
-            LogMessage("[-] Dump timed out after %d min — no files found.",
+            LogMessage("[-] Dump timed out after %d min - no files found.",
                        maxPolls * 500 / 60000);
             LogMessage("[-] Possible causes: anti-cheat blocked injection, insufficient"
                        " privileges, or the dump logic crashed.");
@@ -873,11 +873,30 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 case ID_BTN_INJECT_RUN:   StartInjection(0); break;
                 case ID_BTN_INJECT_LAUNCH: StartInjection(1); break;
                 case ID_BTN_OPEN_FOLDER: {
-                    char myDir[MAX_PATH];
-                    GetMyDir(myDir, sizeof(myDir));
-                    if (myDir[0]) {
-                        ShellExecuteA(hWnd, "open", myDir, NULL, NULL, SW_SHOW);
+                    char openDir[MAX_PATH] = {0};
+
+                    /* Try to open <target process dir>\AutoDumped\ */
+                    char procName[MAX_PATH] = {0};
+                    GetWindowTextA(g_hEditProcess, procName, sizeof(procName));
+                    if (procName[0]) {
+                        char targetDir[MAX_PATH] = {0};
+                        const char* slash = strrchr(procName, '\\');
+                        if (slash) {
+                            SIZE_T dl = (slash - procName) + 1;
+                            if (dl < MAX_PATH) { memcpy(targetDir, procName, dl); targetDir[dl] = 0; }
+                        } else {
+                            GetTargetProcessDir(procName, targetDir, sizeof(targetDir));
+                        }
+                        if (targetDir[0])
+                            snprintf(openDir, sizeof(openDir), "%sAutoDumped\\", targetDir);
                     }
+
+                    /* Fallback: injector's own directory */
+                    if (!openDir[0])
+                        GetMyDir(openDir, sizeof(openDir));
+
+                    if (openDir[0])
+                        ShellExecuteA(hWnd, "open", openDir, NULL, NULL, SW_SHOW);
                     break;
                 }
             }
