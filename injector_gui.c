@@ -507,7 +507,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                      "Dumping ... %ds elapsed, %d files (%d stable)",
                      elapsedSec, count, stableCount);
             PostMessageA(g_hWnd, WM_INJECT_LOG, 0, (LPARAM)_strdup(status));
-        } else if (elapsedSec % 30 == 0) {
+        } else if (elapsedSec > 0 && elapsedSec % 30 == 0) {
             char status[128];
             int remainSec = 120 - elapsedSec;
             if (remainSec < 0) remainSec = 0;
