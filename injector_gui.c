@@ -21,7 +21,47 @@
 #define ID_STATIC_HINT        1009
 #define ID_STATIC_WARN        1010
 
-static HWND g_hWnd           = NULL; /* main window handle */
+/* ── Layout constants ── */
+#define WIN_W     640
+#define WIN_H     500
+#define MARGIN    12
+#define HDR_H     52   /* painted header bar height */
+#define ROW1_Y    (HDR_H + 14)   /* target path row */
+#define ROW2_Y    (ROW1_Y + 36)  /* buttons row */
+#define SEP1_Y    (ROW2_Y + 40)  /* separator after buttons */
+#define HINT_Y    (SEP1_Y + 8)   /* hint / warn banner */
+#define PROG_Y    (HINT_Y + 38)  /* progress bar */
+#define SEP2_Y    (PROG_Y + 22)  /* separator before log */
+#define LOG_Y     (SEP2_Y + 8)   /* log listbox */
+#define STAT_H    22             /* status strip height */
+#define LOG_H     (WIN_H - LOG_Y - STAT_H - 28) /* listbox height */
+#define STAT_Y    (LOG_Y + LOG_H + 6)
+
+/* ── Accent palette ── */
+#define COL_BG        RGB(22,  22,  30 )  /* main background   */
+#define COL_HDR       RGB(15,  15,  22 )  /* header background */
+#define COL_PANEL     RGB(30,  30,  42 )  /* panel / edit bg   */
+#define COL_BORDER    RGB(55,  55,  75 )  /* subtle border     */
+#define COL_ACCENT    RGB(80,  140, 255)  /* blue accent       */
+#define COL_BTN_RUN   RGB(50,  120, 220)  /* inject-run button */
+#define COL_BTN_LAUNCH RGB(60, 160, 90 )  /* launch button     */
+#define COL_BTN_FOLD  RGB(70,  70,  100)  /* folder button     */
+#define COL_BTN_BROW  RGB(55,  55,  80 )  /* browse button     */
+#define COL_TXT       RGB(220, 220, 235)  /* primary text      */
+#define COL_TXT_DIM   RGB(140, 140, 165)  /* dim text          */
+#define COL_WARN_BG   RGB(160, 60,  0  )  /* warning bg        */
+#define COL_WARN_FG   RGB(255, 220, 160)  /* warning text      */
+#define COL_LOG_BG    RGB(14,  14,  20 )  /* log background    */
+#define COL_SEL_BG    RGB(40,  50,  80 )  /* selected row bg   */
+
+/* ── Button state tracking for owner-draw ── */
+#define BTN_COUNT 4
+static HWND  g_btns[BTN_COUNT];          /* ordered: run, launch, folder, browse */
+static BOOL  g_btnHover[BTN_COUNT];      /* mouse is over button i */
+static BOOL  g_btnPress[BTN_COUNT];      /* button i is being pressed */
+static COLORREF g_btnColor[BTN_COUNT];   /* base color per button */
+
+static HWND g_hWnd           = NULL;
 static HWND g_hEditProcess;
 static HWND g_hListLog;
 static HWND g_hBtnInjectRun;
@@ -32,10 +72,16 @@ static HWND g_hStaticStatus;
 static HWND g_hProgress;
 static HWND g_hStaticHint;
 static HWND g_hStaticWarn;
-static HBRUSH g_hBrushWarn = NULL; /* orange background for warning banner */
-static char g_selectedExe[MAX_PATH] = {0};
+static HBRUSH g_hBrushWarn    = NULL;
+static HBRUSH g_hBrushBg      = NULL;
+static HBRUSH g_hBrushPanel   = NULL;
+static HBRUSH g_hBrushLogBg   = NULL;
+static HFONT  g_hFontUI       = NULL;  /* 13pt Segoe UI — labels, buttons */
+static HFONT  g_hFontMono     = NULL;  /* 12pt Consolas  — log, edit      */
+static HFONT  g_hFontTitle    = NULL;  /* 16pt Segoe UI Bold — header     */
+static char   g_selectedExe[MAX_PATH] = {0};
 static volatile int g_injectRunning = 0;
-static HANDLE g_injectorProcess = NULL; /* handle to the running injector.exe */
+static HANDLE g_injectorProcess = NULL;
 
 /* Custom messages from worker -> main thread */
 #define WM_INJECT_LOG      (WM_APP + 1)
@@ -500,19 +546,16 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-/* Global brushes for dark theme */
-static HBRUSH g_hBrushDark     = NULL; /* RGB(30,30,30)  — main bg */
-static HBRUSH g_hBrushDarkEdit = NULL; /* RGB(40,40,40)  — edit/list bg */
-
 /* ── Enable/disable controls (main thread only!) ── */
 static void SetUIControls(BOOL enable) {
-    EnableWindow(g_hBtnInjectRun, enable);
+    EnableWindow(g_hBtnInjectRun,    enable);
     EnableWindow(g_hBtnInjectLaunch, enable);
-    EnableWindow(g_hBtnBrowse, enable);
-    EnableWindow(g_hBtnOpenFolder, enable);
+    EnableWindow(g_hBtnBrowse,       enable);
+    EnableWindow(g_hBtnOpenFolder,   enable);
     ShowWindow(g_hProgress,   enable ? SW_HIDE : SW_SHOW);
     ShowWindow(g_hStaticHint, enable ? SW_SHOW : SW_HIDE);
     ShowWindow(g_hStaticWarn, enable ? SW_HIDE : SW_SHOW);
+    InvalidateRect(g_hWnd, NULL, FALSE);
 }
 
 /* ── Button handlers ── */
@@ -545,104 +588,251 @@ static void StartInjection(int mode) {
     CloseHandle(CreateThread(NULL, 0, WorkerThread, (LPVOID)(INT_PTR)mode, 0, NULL));
 }
 
+/* ── Owner-draw button helper ── */
+static void DrawOwnedButton(DRAWITEMSTRUCT* dis, int idx) {
+    BOOL pressed = (dis->itemState & ODS_SELECTED) || g_btnPress[idx];
+    BOOL hover   = g_btnHover[idx];
+    BOOL enabled = !(dis->itemState & ODS_DISABLED);
+
+    COLORREF base = g_btnColor[idx];
+    COLORREF bg;
+    if (!enabled)  bg = RGB(45, 45, 60);
+    else if (pressed) bg = RGB(GetRValue(base)*6/10, GetGValue(base)*6/10, GetBValue(base)*6/10);
+    else if (hover)   bg = RGB(min(GetRValue(base)+30,255), min(GetGValue(base)+30,255), min(GetBValue(base)+30,255));
+    else              bg = base;
+
+    HBRUSH hbr = CreateSolidBrush(bg);
+    HPEN   hpen = CreatePen(PS_SOLID, 1, hover && enabled ? COL_ACCENT : COL_BORDER);
+    HBRUSH oldBr = (HBRUSH)SelectObject(dis->hDC, hbr);
+    HPEN   oldPen = (HPEN)SelectObject(dis->hDC, hpen);
+    RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+              dis->rcItem.right, dis->rcItem.bottom, 6, 6);
+    SelectObject(dis->hDC, oldBr);
+    SelectObject(dis->hDC, oldPen);
+    DeleteObject(hbr);
+    DeleteObject(hpen);
+
+    char text[128] = {0};
+    GetWindowTextA(dis->hwndItem, text, sizeof(text));
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, enabled ? COL_TXT : COL_TXT_DIM);
+    if (g_hFontUI) SelectObject(dis->hDC, g_hFontUI);
+    DrawTextA(dis->hDC, text, -1, &dis->rcItem,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+/* ── Subclass proc to track hover/press per owner-draw button ── */
+static WNDPROC g_btnOrigProc[BTN_COUNT];
+static LRESULT CALLBACK BtnSubclassProc(HWND hBtn, UINT msg, WPARAM wP, LPARAM lP) {
+    int idx = -1;
+    for (int i = 0; i < BTN_COUNT; i++)
+        if (g_btns[i] == hBtn) { idx = i; break; }
+    if (idx < 0) return DefWindowProcA(hBtn, msg, wP, lP);
+
+    switch (msg) {
+        case WM_MOUSEMOVE:
+            if (!g_btnHover[idx]) {
+                g_btnHover[idx] = TRUE;
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hBtn, 0 };
+                TrackMouseEvent(&tme);
+                InvalidateRect(hBtn, NULL, FALSE);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            g_btnHover[idx] = FALSE;
+            g_btnPress[idx] = FALSE;
+            InvalidateRect(hBtn, NULL, FALSE);
+            break;
+        case WM_LBUTTONDOWN:
+            g_btnPress[idx] = TRUE;
+            InvalidateRect(hBtn, NULL, FALSE);
+            break;
+        case WM_LBUTTONUP:
+            g_btnPress[idx] = FALSE;
+            InvalidateRect(hBtn, NULL, FALSE);
+            break;
+    }
+    return CallWindowProcA(g_btnOrigProc[idx], hBtn, msg, wP, lP);
+}
+
 /* ── Window procedure ── */
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            /* Create dark background brushes */
-            g_hBrushDark     = CreateSolidBrush(RGB(30, 30, 30));
-            g_hBrushDarkEdit = CreateSolidBrush(RGB(40, 40, 40));
+            HINSTANCE hInst = ((CREATESTRUCTA*)lParam)->hInstance;
 
-            HFONT hFont = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                      CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                                      DEFAULT_PITCH | FF_DONTCARE, "Consolas");
+            /* Brushes */
+            g_hBrushBg    = CreateSolidBrush(COL_BG);
+            g_hBrushPanel = CreateSolidBrush(COL_PANEL);
+            g_hBrushLogBg = CreateSolidBrush(COL_LOG_BG);
+            g_hBrushWarn  = CreateSolidBrush(COL_WARN_BG);
 
-            /* Try dark title bar (Win10 20H1+), silently ignored on older builds */
+            /* Fonts */
+            g_hFontUI = CreateFontA(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+            g_hFontMono = CreateFontA(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_DONTCARE, "Consolas");
+            g_hFontTitle = CreateFontA(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+
+            /* Dark title bar */
             HMODULE hDwm = LoadLibraryA("dwmapi.dll");
             if (hDwm) {
-                typedef HRESULT (WINAPI *DWMSETWINDOWATTR)(HWND, DWORD, LPCVOID, DWORD);
-                DWMSETWINDOWATTR pDwm = (DWMSETWINDOWATTR)GetProcAddress(hDwm, "DwmSetWindowAttribute");
-                if (pDwm) {
-                    BOOL dark = TRUE;
-                    pDwm(hWnd, 20, &dark, sizeof(dark));
-                }
+                typedef HRESULT (WINAPI *PFN_DWM)(HWND, DWORD, LPCVOID, DWORD);
+                PFN_DWM fn = (PFN_DWM)GetProcAddress(hDwm, "DwmSetWindowAttribute");
+                if (fn) { BOOL dark = TRUE; fn(hWnd, 20, &dark, sizeof(dark)); }
                 FreeLibrary(hDwm);
             }
 
-            CreateWindowA("STATIC", "Target Process:",
-                          WS_CHILD | WS_VISIBLE, 10, 10, 120, 22,
-                          hWnd, NULL, NULL, NULL);
+            /* ── Target path row ── */
+            HWND hLbl = CreateWindowA("STATIC", "Target:",
+                WS_CHILD | WS_VISIBLE | SS_VCENTER,
+                MARGIN, ROW1_Y + 3, 52, 22, hWnd, NULL, hInst, NULL);
+            if (g_hFontUI) SendMessage(hLbl, WM_SETFONT, (WPARAM)g_hFontUI, 0);
 
-            g_hEditProcess = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                             130, 10, 310, 24,
-                                             hWnd, (HMENU)ID_EDIT_PROCESS, NULL, NULL);
-            if (hFont) SendMessage(g_hEditProcess, WM_SETFONT, (WPARAM)hFont, 0);
+            g_hEditProcess = CreateWindowExA(0, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                MARGIN + 56, ROW1_Y, WIN_W - MARGIN*2 - 56 - 90, 26,
+                hWnd, (HMENU)ID_EDIT_PROCESS, hInst, NULL);
+            if (g_hFontMono) SendMessage(g_hEditProcess, WM_SETFONT, (WPARAM)g_hFontMono, 0);
 
             g_hBtnBrowse = CreateWindowA("BUTTON", "Browse...",
-                                         WS_CHILD | WS_VISIBLE, 445, 10, 85, 24,
-                                         hWnd, (HMENU)ID_BTN_BROWSE, NULL, NULL);
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                WIN_W - MARGIN - 86, ROW1_Y - 1, 86, 28,
+                hWnd, (HMENU)ID_BTN_BROWSE, hInst, NULL);
 
+            /* ── Action buttons row ── */
+            int bw = 150, bh = 32, bx = MARGIN;
             g_hBtnInjectRun = CreateWindowA("BUTTON", "Inject into Running",
-                                            WS_CHILD | WS_VISIBLE, 10, 45, 130, 30,
-                                            hWnd, (HMENU)ID_BTN_INJECT_RUN, NULL, NULL);
-
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_INJECT_RUN, hInst, NULL);
+            bx += bw + 8;
             g_hBtnInjectLaunch = CreateWindowA("BUTTON", "Launch && Inject",
-                                               WS_CHILD | WS_VISIBLE, 145, 45, 130, 30,
-                                               hWnd, (HMENU)ID_BTN_INJECT_LAUNCH, NULL, NULL);
-
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_INJECT_LAUNCH, hInst, NULL);
+            bx += bw + 8;
             g_hBtnOpenFolder = CreateWindowA("BUTTON", "Open Dump Folder",
-                                             WS_CHILD | WS_VISIBLE,
-                                             280, 45, 120, 30,
-                                             hWnd, (HMENU)ID_BTN_OPEN_FOLDER, NULL, NULL);
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                bx, ROW2_Y, bw, bh, hWnd, (HMENU)ID_BTN_OPEN_FOLDER, hInst, NULL);
 
-            /* Progress bar (hidden until injection starts) */
+            /* Register buttons for subclassing + set colors */
+            g_btns[0] = g_hBtnInjectRun;    g_btnColor[0] = COL_BTN_RUN;
+            g_btns[1] = g_hBtnInjectLaunch; g_btnColor[1] = COL_BTN_LAUNCH;
+            g_btns[2] = g_hBtnOpenFolder;   g_btnColor[2] = COL_BTN_FOLD;
+            g_btns[3] = g_hBtnBrowse;       g_btnColor[3] = COL_BTN_BROW;
+            for (int i = 0; i < BTN_COUNT; i++) {
+                g_btnHover[i] = FALSE; g_btnPress[i] = FALSE;
+                g_btnOrigProc[i] = (WNDPROC)SetWindowLongPtrA(
+                    g_btns[i], GWLP_WNDPROC, (LONG_PTR)BtnSubclassProc);
+            }
+
+            /* ── Hint / Warning banner ── */
+            g_hStaticHint = CreateWindowA("STATIC",
+                "Steps:  1. Browse for the target .exe    "
+                "2. Click Launch & Inject (or Inject into Running)    "
+                "3. Wait for dump to finish    "
+                "4. Open Dump Folder to view results",
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                MARGIN, HINT_Y, WIN_W - MARGIN*2, 30,
+                hWnd, (HMENU)ID_STATIC_HINT, hInst, NULL);
+            if (g_hFontUI) SendMessage(g_hStaticHint, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+
+            g_hStaticWarn = CreateWindowA("STATIC",
+                "  (!!)  Do NOT close the target process until the dump is complete!",
+                WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
+                MARGIN, HINT_Y, WIN_W - MARGIN*2, 30,
+                hWnd, (HMENU)ID_STATIC_WARN, hInst, NULL);
+            if (g_hFontUI) SendMessage(g_hStaticWarn, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+
+            /* ── Progress bar ── */
             g_hProgress = CreateWindowExA(0, PROGRESS_CLASSA, "",
-                                          WS_CHILD | PBS_SMOOTH,
-                                          405, 49, 130, 22,
-                                          hWnd, (HMENU)ID_PROGRESS, NULL, NULL);
+                WS_CHILD | PBS_SMOOTH,
+                MARGIN, PROG_Y, WIN_W - MARGIN*2, 14,
+                hWnd, (HMENU)ID_PROGRESS, hInst, NULL);
             SendMessage(g_hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
             SendMessage(g_hProgress, PBM_SETPOS, 0, 0);
+            SendMessage(g_hProgress, PBM_SETBARCOLOR, 0, (LPARAM)COL_ACCENT);
+            SendMessage(g_hProgress, PBM_SETBKCOLOR,  0, (LPARAM)COL_PANEL);
             ShowWindow(g_hProgress, SW_HIDE);
 
+            /* ── Log listbox ── */
+            g_hListLog = CreateWindowExA(0, "LISTBOX", "",
+                WS_CHILD | WS_VISIBLE | LBS_NOINTEGRALHEIGHT |
+                LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL,
+                MARGIN, LOG_Y, WIN_W - MARGIN*2, LOG_H,
+                hWnd, (HMENU)ID_LIST_LOG, hInst, NULL);
+            if (g_hFontMono) SendMessage(g_hListLog, WM_SETFONT, (WPARAM)g_hFontMono, 0);
+            SendMessageA(g_hListLog, LB_SETITEMHEIGHT, 0, 17);
+
+            /* ── Status strip ── */
             g_hStaticStatus = CreateWindowA("STATIC", "Ready.",
-                                            WS_CHILD | WS_VISIBLE | SS_SUNKEN,
-                                            10, 85, 530, 20,
-                                            hWnd, (HMENU)ID_STATIC_STATUS, NULL, NULL);
-            if (hFont) SendMessage(g_hStaticStatus, WM_SETFONT, (WPARAM)hFont, 0);
-
-            /* Step-by-step instructions — visible on startup, hidden while running */
-            g_hStaticHint = CreateWindowA("STATIC",
-                                          "How to use:  "
-                                          "1. Browse for the target .exe  "
-                                          "2. Click \"Launch & Inject\" (or \"Inject into Running\")  "
-                                          "3. Wait for the dump to finish  "
-                                          "4. Click \"Open Dump Folder\" to view results",
-                                          WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                          10, 112, 530, 32,
-                                          hWnd, (HMENU)ID_STATIC_HINT, NULL, NULL);
-            if (hFont) SendMessage(g_hStaticHint, WM_SETFONT, (WPARAM)hFont, 0);
-
-            /* Warning banner — hidden on startup, shown while injection/dump is running */
-            g_hStaticWarn = CreateWindowA("STATIC",
-                                          "  (!!)  Do NOT close the target process until the dump is complete!",
-                                          WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
-                                          10, 112, 530, 32,
-                                          hWnd, (HMENU)ID_STATIC_WARN, NULL, NULL);
-            if (hFont) SendMessage(g_hStaticWarn, WM_SETFONT, (WPARAM)hFont, 0);
-            g_hBrushWarn = CreateSolidBrush(RGB(180, 80, 0));
-
-            g_hListLog = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
-                                         WS_CHILD | WS_VISIBLE | LBS_NOINTEGRALHEIGHT |
-                                         LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
-                                         WS_VSCROLL | WS_HSCROLL,
-                                         10, 152, 530, 240,
-                                         hWnd, (HMENU)ID_LIST_LOG, NULL, NULL);
-            if (hFont) SendMessage(g_hListLog, WM_SETFONT, (WPARAM)hFont, 0);
-            SendMessageA(g_hListLog, LB_SETITEMHEIGHT, 0, 16);
+                WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                MARGIN + 4, STAT_Y, WIN_W - MARGIN*2 - 4, STAT_H,
+                hWnd, (HMENU)ID_STATIC_STATUS, hInst, NULL);
+            if (g_hFontUI) SendMessage(g_hStaticStatus, WM_SETFONT, (WPARAM)g_hFontUI, 0);
 
             LogMessage("[*] Ready. Enter a process name or browse for an .exe.");
+            return 0;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+
+            RECT rc;
+            GetClientRect(hWnd, &rc);
+
+            /* Main background */
+            FillRect(hdc, &rc, g_hBrushBg);
+
+            /* Header bar */
+            RECT hdr = { 0, 0, rc.right, HDR_H };
+            HBRUSH hbrHdr = CreateSolidBrush(COL_HDR);
+            FillRect(hdc, &hdr, hbrHdr);
+            DeleteObject(hbrHdr);
+
+            /* Accent line under header */
+            HPEN hpen = CreatePen(PS_SOLID, 2, COL_ACCENT);
+            HPEN oldPen = (HPEN)SelectObject(hdc, hpen);
+            MoveToEx(hdc, 0, HDR_H, NULL);
+            LineTo(hdc, rc.right, HDR_H);
+            SelectObject(hdc, oldPen);
+            DeleteObject(hpen);
+
+            /* Header title */
+            SetBkMode(hdc, TRANSPARENT);
+            if (g_hFontTitle) SelectObject(hdc, g_hFontTitle);
+            SetTextColor(hdc, COL_TXT);
+            RECT titleRc = { MARGIN, 10, 400, HDR_H };
+            DrawTextA(hdc, "AutoDump", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            /* Header subtitle */
+            if (g_hFontUI) SelectObject(hdc, g_hFontUI);
+            SetTextColor(hdc, COL_TXT_DIM);
+            RECT subRc = { MARGIN + 108, 14, 500, HDR_H };
+            DrawTextA(hdc, "Stealth Memory Dumper", -1, &subRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            /* Separator above log */
+            HPEN hpen2 = CreatePen(PS_SOLID, 1, COL_BORDER);
+            HPEN oldPen2 = (HPEN)SelectObject(hdc, hpen2);
+            MoveToEx(hdc, MARGIN, SEP2_Y, NULL);
+            LineTo(hdc, rc.right - MARGIN, SEP2_Y);
+
+            /* Separator above status */
+            MoveToEx(hdc, MARGIN, STAT_Y - 4, NULL);
+            LineTo(hdc, rc.right - MARGIN, STAT_Y - 4);
+            SelectObject(hdc, oldPen2);
+            DeleteObject(hpen2);
+
+            /* Edit background panel */
+            RECT editPanelRc = { MARGIN - 2, ROW1_Y - 3,
+                                 WIN_W - MARGIN + 2, ROW1_Y + 30 };
+            FillRect(hdc, &editPanelRc, g_hBrushPanel);
+
+            EndPaint(hWnd, &ps);
             return 0;
         }
 
@@ -667,12 +857,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetUIControls(FALSE);
             SendMessage(g_hProgress, PBM_SETPOS, 0, 0);
             SetWindowTextA(g_hStaticStatus, "Injecting ...");
+            InvalidateRect(hWnd, NULL, FALSE);
             return 0;
 
         case WM_INJECT_DONE:
             SetUIControls(TRUE);
             g_injectRunning = 0;
             SetWindowTextA(g_hStaticStatus, "Ready.");
+            InvalidateRect(hWnd, NULL, FALSE);
             return 0;
 
         case WM_COMMAND: {
@@ -706,81 +898,88 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_DESTROY:
-            /* Clean up brushes */
-            if (g_hBrushDark)     DeleteObject(g_hBrushDark);
-            if (g_hBrushDarkEdit) DeleteObject(g_hBrushDarkEdit);
-            if (g_hBrushWarn)     DeleteObject(g_hBrushWarn);
+            if (g_hBrushBg)    DeleteObject(g_hBrushBg);
+            if (g_hBrushPanel) DeleteObject(g_hBrushPanel);
+            if (g_hBrushLogBg) DeleteObject(g_hBrushLogBg);
+            if (g_hBrushWarn)  DeleteObject(g_hBrushWarn);
+            if (g_hFontUI)     DeleteObject(g_hFontUI);
+            if (g_hFontMono)   DeleteObject(g_hFontMono);
+            if (g_hFontTitle)  DeleteObject(g_hFontTitle);
             PostQuitMessage(0);
             return 0;
 
-        /* ── Dark mode background colors using pre-created brushes ── */
         case WM_CTLCOLORSTATIC: {
             HDC hdc = (HDC)wParam;
             HWND hCtrl = (HWND)lParam;
             if (hCtrl == g_hStaticWarn) {
-                SetBkColor(hdc, RGB(180, 80, 0));
-                SetTextColor(hdc, RGB(255, 230, 180));
+                SetBkColor(hdc, COL_WARN_BG);
+                SetTextColor(hdc, COL_WARN_FG);
                 return (LRESULT)g_hBrushWarn;
             }
-            SetBkColor(hdc, RGB(30, 30, 30));
-            SetTextColor(hdc, RGB(200, 200, 200));
-            return (LRESULT)g_hBrushDark;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, hCtrl == g_hStaticStatus ? COL_TXT_DIM : COL_TXT);
+            return (LRESULT)g_hBrushBg;
         }
         case WM_CTLCOLOREDIT: {
             HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, RGB(40, 40, 40));
-            SetTextColor(hdc, RGB(220, 220, 220));
-            return (LRESULT)g_hBrushDarkEdit;
+            SetBkColor(hdc, COL_PANEL);
+            SetTextColor(hdc, COL_TXT);
+            return (LRESULT)g_hBrushPanel;
         }
         case WM_CTLCOLORLISTBOX: {
             HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, RGB(20, 20, 20));
-            SetTextColor(hdc, RGB(200, 200, 200));
-            return (LRESULT)g_hBrushDarkEdit;
+            SetBkColor(hdc, COL_LOG_BG);
+            SetTextColor(hdc, COL_TXT);
+            return (LRESULT)g_hBrushLogBg;
         }
 
         case WM_MEASUREITEM: {
             MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lParam;
             if (mis->CtlID == ID_LIST_LOG)
-                mis->itemHeight = 16;
+                mis->itemHeight = 17;
             return TRUE;
         }
 
         case WM_DRAWITEM: {
             DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
-            if (dis->CtlID != ID_LIST_LOG) break;
-            if (dis->itemID == (UINT)-1) break;
+            if (dis->CtlID == ID_LIST_LOG) {
+                if (dis->itemID == (UINT)-1) break;
 
-            char text[1024] = {0};
-            SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)text);
+                char text[1024] = {0};
+                SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)text);
 
-            /* Choose text color by prefix */
-            COLORREF fg;
-            if (text[0] == '[' && text[1] == '+') {
-                fg = RGB(100, 220, 100);  /* green  — success */
-            } else if (text[0] == '[' && text[1] == '-') {
-                fg = RGB(220, 80, 80);    /* red    — error   */
-            } else if (strncmp(text, "[injector]", 10) == 0) {
-                fg = RGB(140, 180, 220);  /* blue   — injector output */
-            } else {
-                fg = RGB(190, 190, 190);  /* gray   — info    */
+                COLORREF fg;
+                if      (text[0]=='['&&text[1]=='+') fg = RGB(90,  210, 110); /* green  */
+                else if (text[0]=='['&&text[1]=='-') fg = RGB(220, 75,  75);  /* red    */
+                else if (strncmp(text,"[injector]",10)==0) fg = RGB(120,170,240); /* blue */
+                else                                 fg = COL_TXT_DIM;        /* gray   */
+
+                COLORREF bg = (dis->itemState & ODS_SELECTED) ? COL_SEL_BG : COL_LOG_BG;
+                HBRUSH hbr = CreateSolidBrush(bg);
+                FillRect(dis->hDC, &dis->rcItem, hbr);
+                DeleteObject(hbr);
+
+                /* Left accent stripe for [+] / [-] */
+                if (text[0]=='['&&(text[1]=='+'||text[1]=='-')) {
+                    HBRUSH stripe = CreateSolidBrush(fg);
+                    RECT sr = dis->rcItem; sr.right = sr.left + 3;
+                    FillRect(dis->hDC, &sr, stripe);
+                    DeleteObject(stripe);
+                }
+
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, fg);
+                if (g_hFontMono) SelectObject(dis->hDC, g_hFontMono);
+                RECT rc = dis->rcItem; rc.left += 8;
+                DrawTextA(dis->hDC, text, -1, &rc,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                return TRUE;
             }
-
-            /* Background */
-            COLORREF bg = (dis->itemState & ODS_SELECTED)
-                          ? RGB(50, 50, 70) : RGB(20, 20, 20);
-            HBRUSH hbr = CreateSolidBrush(bg);
-            FillRect(dis->hDC, &dis->rcItem, hbr);
-            DeleteObject(hbr);
-
-            SetBkMode(dis->hDC, TRANSPARENT);
-            SetTextColor(dis->hDC, fg);
-
-            RECT rc = dis->rcItem;
-            rc.left += 4;
-            DrawTextA(dis->hDC, text, -1, &rc,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            return TRUE;
+            if (dis->CtlID == ID_BTN_INJECT_RUN)    { DrawOwnedButton(dis, 0); return TRUE; }
+            if (dis->CtlID == ID_BTN_INJECT_LAUNCH)  { DrawOwnedButton(dis, 1); return TRUE; }
+            if (dis->CtlID == ID_BTN_OPEN_FOLDER)    { DrawOwnedButton(dis, 2); return TRUE; }
+            if (dis->CtlID == ID_BTN_BROWSE)         { DrawOwnedButton(dis, 3); return TRUE; }
+            break;
         }
     }
     return DefWindowProcA(hWnd, msg, wParam, lParam);
@@ -802,7 +1001,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
+    wc.hbrBackground = CreateSolidBrush(COL_BG);
     wc.lpszClassName = "InjectorGUI";
 
     if (!RegisterClassExA(&wc)) {
@@ -810,11 +1009,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    HWND hWnd = CreateWindowExA(0, "InjectorGUI", "Stealth DLL Injector - GUI",
+    HWND hWnd = CreateWindowExA(0, "InjectorGUI", "AutoDump",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                 WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT,
-                                570, 440, NULL, NULL, hInstance, NULL);
+                                WIN_W + 16, WIN_H + 39, NULL, NULL, hInstance, NULL);
     if (!hWnd) {
         MessageBoxA(NULL, "Failed to create window.", "Error", MB_ICONERROR);
         return 1;
