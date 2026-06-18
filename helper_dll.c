@@ -2413,122 +2413,22 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         ZERO_DIR(IMAGE_DIRECTORY_ENTRY_EXPORT)         /* Exports (EXE has none) */
 #undef ZERO_DIR
 
-        /* 4. Validate and compact .pdata (exception directory) entries.
-         *
-         * A RUNTIME_FUNCTION is valid only if:
-         *   a) All three RVAs are within [0, imageSize)
-         *   b) Begin < End
-         *   c) The UNWIND_INFO at Unwind RVA passes a deep structural check:
-         *      - Version field (bits 2:0) == 1
-         *      - Flags field (bits 7:3) in [0..7]
-         *      - The whole struct (header + CountOfCodes*2 bytes, DWORD-aligned)
-         *        fits within imageSize
-         *      - If UNW_FLAG_CHAININFO is set, the chained RUNTIME_FUNCTION
-         *        immediately following the unwind codes must itself be valid
-         *   d) The unwind data is non-zero (zero page = dump page wasn't copied)
-         *
-         * Bad entries are removed by in-place compaction and the directory
-         * size is shrunk so IDA never sees them. */
-        DWORD pdataRva  = 0, pdataSize = 0;
+        /* 4. Zero the exception (.pdata) directory entirely.
+         *    The RUNTIME_FUNCTION entries themselves look valid, but the
+         *    UNWIND_INFO structures they reference in .rdata are encrypted.
+         *    IDA sees corrupted unwind data and skips the functions. By
+         *    zeroing the directory, IDA ignores the table and uses heuristics
+         *    to discover functions — which works better than partial failure. */
         if (numDir > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
-            pdataRva  = pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
-            pdataSize = pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
-        }
-        DWORD badPdata = 0, goodPdata = 0;
-        if (pdataRva && pdataSize && pdataRva + pdataSize <= imageSize) {
-            typedef struct { DWORD Begin; DWORD End; DWORD Unwind; } RF;
-            LPBYTE db  = (LPBYTE)dumpBuffer;
-            RF* rf     = (RF*)(db + pdataRva);
-            DWORD cnt  = pdataSize / sizeof(RF);
-            DWORD keep = 0;
-            DWORD i;
-            for (i = 0; i < cnt; i++) {
-                BOOL bad = FALSE;
-
-                /* a/b: basic RVA sanity */
-                if (rf[i].Begin == 0 && rf[i].End == 0)    bad = TRUE;
-                if (rf[i].Begin  >= imageSize)              bad = TRUE;
-                if (rf[i].End    >  imageSize)              bad = TRUE;
-                if (rf[i].Unwind >= imageSize)              bad = TRUE;
-                if (!bad && rf[i].Begin >= rf[i].End)       bad = TRUE;
-
-                /* c/d: deep UNWIND_INFO validation */
-                if (!bad) {
-                    DWORD uRva = rf[i].Unwind;
-                    /* Need at least 4 bytes for the header */
-                    if (uRva + 4 > imageSize) {
-                        bad = TRUE;
-                    } else {
-                        BYTE  verFlags    = db[uRva + 0];
-                        BYTE  countCodes  = db[uRva + 2];
-                        BYTE  version     = verFlags & 0x07;
-                        BYTE  flags       = (verFlags >> 3) & 0x1F;
-
-                        /* d: zero first byte means page was never copied */
-                        if (verFlags == 0)          bad = TRUE;
-                        /* c: version must be 1 (or 2 for newer MSVC) */
-                        if (version < 1 || version > 2) bad = TRUE;
-                        /* flags 0-7 are defined; 8-31 are reserved */
-                        if (flags > 7)              bad = TRUE;
-                        /* CountOfCodes sanity (each code is 2 bytes) */
-                        if (countCodes > 128)        bad = TRUE;
-
-                        if (!bad) {
-                            /* Total struct = 4-byte header + countCodes*2, DWORD-aligned */
-                            DWORD bodySize = (4 + (DWORD)countCodes * 2 + 3) & ~3u;
-                            if (uRva + bodySize > imageSize) {
-                                bad = TRUE;
-                            } else if (flags & 0x04 /* UNW_FLAG_CHAININFO */) {
-                                /* Chained entry: a RUNTIME_FUNCTION sits immediately
-                                 * after the unwind codes; validate its RVAs too. */
-                                DWORD chainOff = uRva + bodySize;
-                                if (chainOff + 12 > imageSize) {
-                                    bad = TRUE;
-                                } else {
-                                    DWORD cBegin  = *(DWORD*)(db + chainOff + 0);
-                                    DWORD cEnd    = *(DWORD*)(db + chainOff + 4);
-                                    DWORD cUnwind = *(DWORD*)(db + chainOff + 8);
-                                    if (cBegin  >= imageSize ||
-                                        cEnd    >  imageSize ||
-                                        cUnwind >= imageSize ||
-                                        cBegin  >= cEnd)
-                                        bad = TRUE;
-                                    /* Version check on chained UNWIND_INFO */
-                                    if (!bad && cUnwind + 1 <= imageSize) {
-                                        BYTE cv = (db[cUnwind]) & 0x07;
-                                        if (cv < 1 || cv > 2) bad = TRUE;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (bad) {
-                    badPdata++;
-                } else {
-                    if (keep != i)
-                        rf[keep] = rf[i]; /* compact */
-                    keep++;
-                    goodPdata++;
-                }
-            }
-            /* Zero the removed trailing entries and shrink the directory */
-            DWORD removed = cnt - keep;
-            if (removed > 0) {
-                memset(&rf[keep], 0, removed * sizeof(RF));
-                pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size =
-                    keep * sizeof(RF);
-            }
-            DebugLogFmt("pdata: %lu good, %lu bad removed (%lu total)",
-                        goodPdata, badPdata, cnt);
+            pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0;
+            pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = 0;
+            DebugLog("pdata: directory zeroed (encrypted unwind info)");
         }
 
         /* 5. Zero the DLL flag so IDA treats it as an EXE */
         pDumpNt->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
 
-        DebugLogFmt("PE fixup done: ImageBase=0x140000000, reloc/debug/security zeroed, %lu bad pdata cleared",
-                    badPdata);
+        DebugLog("PE fixup done: ImageBase=0x140000000, reloc/debug/security/pdata zeroed");
     }
     
     ScanAndTrackTlsCallbacks(moduleBase);
