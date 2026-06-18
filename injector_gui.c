@@ -70,6 +70,41 @@ static void GetMyDir(char* out, SIZE_T outSize) {
     }
 }
 
+/* ── Get the directory of a running process by its name (with trailing backslash) ── */
+static void GetTargetProcessDir(const char* processName, char* out, SIZE_T outSize) {
+    out[0] = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe = {0};
+    pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+    if (Process32First(snap, &pe)) {
+        do {
+            if (_stricmp(pe.szExeFile, processName) == 0) {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    if (!pid) return;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+    char exePath[MAX_PATH];
+    DWORD len = sizeof(exePath);
+    if (QueryFullProcessImageNameA(hProc, 0, exePath, &len)) {
+        char* slash = strrchr(exePath, '\\');
+        if (slash) {
+            SIZE_T dirLen = (slash - exePath) + 1;
+            if (dirLen < outSize) {
+                memcpy(out, exePath, dirLen);
+                out[dirLen] = 0;
+            }
+        }
+    }
+    CloseHandle(hProc);
+}
+
 /* ── Check if a file exists ── */
 static int FileExists(const char* path) {
     WIN32_FIND_DATAA ffd;
@@ -270,36 +305,52 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     g_injectorProcess = NULL;
 
     LogMessage("[*] Injector exited with code %lu", exitCode);
-    if (exitCode == 0)
+    if (exitCode == 0) {
         LogMessage("[+] Injection complete. Dump running in target process (~2 min).");
-    else
-        LogMessage("[-] Injector failed with exit code %lu", exitCode);
+    } else {
+        LogMessage("[-] Injection failed (exit code %lu) — cannot dump.", exitCode);
+        PostMessageA(g_hWnd, WM_INJECT_DONE, 0, 0);
+        return 0;
+    }
 
-    /* Keep the progress bar / "injecting" state alive for a bit more
-       since the actual dump runs inside the target process. We'll show
-       a "waiting for dump" state for up to 2 minutes. */
     LogMessage("[*] Waiting for dump output files ...");
 
     /* Poll for dump files up to ~3 minutes.
-       The helper DLL now writes output files to our directory (thanks to
-       the output-directory-marker fix), but also check CWD as fallback. */
+       The helper DLL writes output files to <target dir>\AutoDumped\. */
     char pollDirs[2][MAX_PATH];
     int numPollDirs = 0;
 
-    GetMyDir(pollDirs[0], sizeof(pollDirs[0]));
-    if (pollDirs[0][0]) numPollDirs = 1;
-
-    /* Also add CWD as a fallback */
-    if (GetCurrentDirectoryA(MAX_PATH, pollDirs[1]) > 0) {
-        /* Avoid duplicating if same as our dir */
-        if (numPollDirs == 0 || _stricmp(pollDirs[0], pollDirs[1]) != 0) {
-            /* Add backslash if missing */
-            size_t cwdLen = strlen(pollDirs[1]);
-            if (cwdLen > 0 && pollDirs[1][cwdLen - 1] != '\\') {
-                pollDirs[1][cwdLen] = '\\';
-                pollDirs[1][cwdLen + 1] = 0;
+    {
+        char targetDir[MAX_PATH] = {0};
+        if (mode == 1) {
+            /* Launch mode: processName may be a full path — extract the directory */
+            const char* slash = strrchr(processName, '\\');
+            if (slash) {
+                SIZE_T dirLen = (slash - processName) + 1;
+                if (dirLen < MAX_PATH) {
+                    memcpy(targetDir, processName, dirLen);
+                    targetDir[dirLen] = 0;
+                }
+            } else {
+                GetTargetProcessDir(processName, targetDir, sizeof(targetDir));
             }
-            numPollDirs = 2;
+        } else {
+            GetTargetProcessDir(processName, targetDir, sizeof(targetDir));
+        }
+        if (targetDir[0]) {
+            snprintf(pollDirs[0], sizeof(pollDirs[0]), "%sAutoDumped\\", targetDir);
+            numPollDirs = 1;
+        }
+    }
+
+    /* Fallback: also check CWD\AutoDumped\ in case process dir lookup failed */
+    {
+        char cwd[MAX_PATH];
+        if (GetCurrentDirectoryA(MAX_PATH, cwd) > 0) {
+            int idx = numPollDirs > 0 ? 1 : 0;
+            snprintf(pollDirs[idx], sizeof(pollDirs[idx]), "%s\\AutoDumped\\", cwd);
+            if (numPollDirs == 0 || _stricmp(pollDirs[0], pollDirs[idx]) != 0)
+                numPollDirs = idx + 1;
         }
     }
 
@@ -308,8 +359,38 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     int lastFileCount = 0;
     int stableCount  = 0; /* consecutive polls with same count */
 
+    /* Resolve the target process name for liveness checks */
+    const char* justName = strrchr(processName, '\\');
+    if (justName) justName++; else justName = processName;
+
     while (pollCount < maxPolls) {
         int count = 0;
+
+        /* Check if target process is still alive */
+        DWORD targetPid = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe = {0};
+            pe.dwSize = sizeof(pe);
+            if (Process32First(snap, &pe)) {
+                do {
+                    if (_stricmp(pe.szExeFile, justName) == 0) {
+                        targetPid = pe.th32ProcessID;
+                        break;
+                    }
+                } while (Process32Next(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+        if (!targetPid) {
+            if (lastFileCount > 0) {
+                LogMessage("[*] Target process exited. Dump files: %d", lastFileCount);
+            } else {
+                LogMessage("[-] Target process terminated before dump completed.");
+                LogMessage("[-] Check helper_debug.txt in the AutoDumped folder for details.");
+            }
+            break;
+        }
 
         /* Search all poll directories for .bin and .dmp files */
         for (int d = 0; d < numPollDirs; d++) {
@@ -376,13 +457,14 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
     if (pollCount >= maxPolls) {
         if (lastFileCount > 0) {
-            LogMessage("[*] Dump polling ended (%d files found, dirs: %s & CWD).",
-                       lastFileCount, pollDirs[0]);
+            LogMessage("[+] Dump polling ended. %d file(s) written to: %s",
+                       lastFileCount, numPollDirs > 0 ? pollDirs[0] : "unknown");
         } else {
-            LogMessage("[*] Dump polling timed out (%d min). No dump files found.",
+            LogMessage("[-] Dump timed out after %d min — no files found.",
                        maxPolls * 500 / 60000);
-            LogMessage("[*] Check the target process's working directory for dump files.");
-            LogMessage("[*] Or look for helper_debug.txt for debug logs.");
+            LogMessage("[-] Possible causes: anti-cheat blocked injection, insufficient"
+                       " privileges, or the dump logic crashed.");
+            LogMessage("[-] Check helper_debug.txt in the AutoDumped folder for details.");
         }
     }
 

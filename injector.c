@@ -718,7 +718,7 @@ static DWORD GetRandomDelay(DWORD min, DWORD max) {
 
 /* Forward declarations for output directory helpers */
 static DWORD FindOutputDirRva(PVOID dllBuffer, SIZE_T dllSize);
-static void GetMyDir(char* out, SIZE_T outSize);
+static void GetProcessDir(DWORD pid, char* out, SIZE_T outSize);
 
 static int EarlyInjectSuspended(PLAUNCHED_PROCESS pLaunchedProc, const char* dllPath) {
     HANDLE hProcess = pLaunchedProc->hProcess;
@@ -732,15 +732,18 @@ static int EarlyInjectSuspended(PLAUNCHED_PROCESS pLaunchedProc, const char* dll
     
     PVOID dllBase = ReflectiveLoadDLL(hProcess, dllBuffer, dllSize);
     
-    /* If marker found, write the injector's directory into the remote DLL */
+    /* If marker found, write the output directory into the remote DLL */
     if (dllBase && outputPathRva) {
-        char myDir[MAX_PATH];
-        GetMyDir(myDir, sizeof(myDir));
-        if (myDir[0]) {
+        char targetDir[MAX_PATH];
+        GetProcessDir(pLaunchedProc->processId, targetDir, sizeof(targetDir));
+        if (targetDir[0]) {
+            char outDir[MAX_PATH];
+            snprintf(outDir, sizeof(outDir), "%sAutoDumped\\", targetDir);
+            CreateDirectoryA(outDir, NULL);
             PVOID remotePath = (LPBYTE)dllBase + outputPathRva;
             SIZE_T written = 0;
-            NtWriteVirtualMemory(hProcess, remotePath, myDir,
-                                 (SIZE_T)strlen(myDir) + 1, &written);
+            NtWriteVirtualMemory(hProcess, remotePath, outDir,
+                                 (SIZE_T)strlen(outDir) + 1, &written);
         }
     }
     
@@ -863,20 +866,24 @@ static DWORD FindOutputDirRva(PVOID dllBuffer, SIZE_T dllSize) {
     return 0;
 }
 
-/* Get the directory containing injector.exe (with trailing backslash) */
-static void GetMyDir(char* out, SIZE_T outSize) {
-    char mod[MAX_PATH];
-    GetModuleFileNameA(NULL, mod, sizeof(mod));
-    char* slash = strrchr(mod, '\\');
-    if (slash) {
-        SIZE_T len = (slash - mod) + 1;
-        if (len < outSize) {
-            memcpy(out, mod, len);
-            out[len] = 0;
+/* Get the directory containing the target process's executable (with trailing backslash) */
+static void GetProcessDir(DWORD pid, char* out, SIZE_T outSize) {
+    out[0] = 0;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+    char exePath[MAX_PATH];
+    DWORD len = sizeof(exePath);
+    if (QueryFullProcessImageNameA(hProc, 0, exePath, &len)) {
+        char* slash = strrchr(exePath, '\\');
+        if (slash) {
+            SIZE_T dirLen = (slash - exePath) + 1;
+            if (dirLen < outSize) {
+                memcpy(out, exePath, dirLen);
+                out[dirLen] = 0;
+            }
         }
-    } else {
-        out[0] = 0;
     }
+    CloseHandle(hProc);
 }
 
 static int MaximumStealthInject(DWORD processId, const char* dllPath) {
@@ -900,6 +907,7 @@ static int MaximumStealthInject(DWORD processId, const char* dllPath) {
     SIZE_T dllSize;
     PVOID dllBuffer = ReadDLLFile(dllPath, &dllSize);
     if (!dllBuffer) {
+        printf("[-] Failed to read helper.dll from disk\n");
         CloseHandle(hProcess);
         return 2;
     }
@@ -914,17 +922,20 @@ static int MaximumStealthInject(DWORD processId, const char* dllPath) {
     
     PVOID dllBase = ReflectiveLoadDLL(hProcess, dllBuffer, dllSize);
     
-    /* If marker was found, write the injector's directory into the remote DLL */
+    /* If marker was found, write the output directory into the remote DLL */
     if (dllBase && outputPathRva) {
-        char myDir[MAX_PATH];
-        GetMyDir(myDir, sizeof(myDir));
-        if (myDir[0]) {
+        char targetDir[MAX_PATH];
+        GetProcessDir(processId, targetDir, sizeof(targetDir));
+        if (targetDir[0]) {
+            char outDir[MAX_PATH];
+            snprintf(outDir, sizeof(outDir), "%sAutoDumped\\", targetDir);
+            CreateDirectoryA(outDir, NULL);
             PVOID remotePath = (LPBYTE)dllBase + outputPathRva;
             SIZE_T written = 0;
-            NTSTATUS ws = NtWriteVirtualMemory(hProcess, remotePath, myDir,
-                                                (SIZE_T)strlen(myDir) + 1, &written);
+            NTSTATUS ws = NtWriteVirtualMemory(hProcess, remotePath, outDir,
+                                                (SIZE_T)strlen(outDir) + 1, &written);
             if (ws == STATUS_SUCCESS) {
-                printf("[*] Output directory set: %s\n", myDir);
+                printf("[*] Output directory set: %s\n", outDir);
             } else {
                 printf("[-] Failed to write output directory to remote process\n");
             }
@@ -935,6 +946,7 @@ static int MaximumStealthInject(DWORD processId, const char* dllPath) {
     VirtualFree(dllBuffer, 0, MEM_RELEASE);
     
     if (!dllBase) {
+        printf("[-] Reflective DLL load into target process failed\n");
         CloseHandle(hProcess);
         return 3;
     }
@@ -943,6 +955,9 @@ static int MaximumStealthInject(DWORD processId, const char* dllPath) {
     
     BOOL entryResult = CallDllEntryPoint(hProcess, processId, dllBase);
     CloseHandle(hProcess);
+    
+    if (!entryResult)
+        printf("[-] DLL entry point call failed — dump may not have started\n");
     
     return entryResult ? 0 : 4;
 }
@@ -992,7 +1007,7 @@ int main(int argc, char* argv[]) {
     if (result == 0) {
         printf("[+] Done. Dump starts in 2 min.\n");
     } else {
-        printf("[-] Failed (err %d)\n", result);
+        printf("[-] Injection failed (code %d)\n", result);
     }
     
     return result;
