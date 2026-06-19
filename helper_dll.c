@@ -184,6 +184,45 @@ static LONG CALLBACK PageCopyVEH(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Crash catcher — logs the first unique exception, then stays silent.
+ * MUST NOT do anything that could trigger another exception (no file I/O,
+ * no heap alloc) or we get recursive VEH → stack overflow.
+ * WoW's anti-cheat fires breakpoints and heap-corruption checks constantly;
+ * we filter those out entirely. */
+static volatile LONG g_vehInHandler = 0;
+static volatile LONG g_vehCrashLogged = 0;
+
+static LONG CALLBACK CrashCatcherVEH(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+    /* Filter out benign and anti-cheat exceptions entirely */
+    if (code == STATUS_GUARD_PAGE_VIOLATION ||
+        code == 0x4001000A /* DBG_PRINTEXCEPTION_C */ ||
+        code == 0x40010005 /* DBG_SINGLESTEP */ ||
+        code == 0x80000003 /* STATUS_BREAKPOINT — WoW anti-debug */ ||
+        code == 0xC0000420 /* STATUS_HEAP_CORRUPTION — WoW anti-tamper */ ||
+        code == 0xE06D7363 /* C++ exception */ ||
+        code == 0x406D1388 /* MS_VC_EXCEPTION (thread name) */)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Re-entrancy guard — if we're already inside the VEH, don't log */
+    if (InterlockedCompareExchange(&g_vehInHandler, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Only log the first real crash */
+    if (InterlockedCompareExchange(&g_vehCrashLogged, 1, 0) == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "CRASH: code=0x%08X addr=%p RIP=%p",
+                 code, ep->ExceptionRecord->ExceptionAddress,
+                 (void*)ep->ContextRecord->Rip);
+        DebugLog(msg);
+    }
+
+    InterlockedExchange(&g_vehInHandler, 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static BOOL DecryptPageWithGadget(PVOID srcPage, PVOID dstBuffer) {
     if (!g_decryptGadget) return FALSE;
     UINT64* src = (UINT64*)srcPage;
@@ -2190,8 +2229,10 @@ static void DumpWowLoader(void) {
 static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     (void)lpParam;
     char logBuf[256];
-    
+
+    DebugLog("DumpWorkerThread: starting");
     StealthSleep(50);
+    DebugLog("DumpWorkerThread: post-sleep, init decryption");
     InitForcedDecryption();
     RandomStealthSleep(50, 150);
     
@@ -2202,6 +2243,8 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     }
     
     PVOID moduleBase = peb->ImageBaseAddress;
+    snprintf(logBuf, sizeof(logBuf), "DumpWorkerThread: moduleBase=%p", moduleBase);
+    DebugLog(logBuf);
     InitSpoofedCall(moduleBase);
     
     /*
@@ -2214,22 +2257,36 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
      */
     /* Read imageSize from PE headers before using it in the gadget scan */
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)moduleBase;
-    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        DebugLog("ERR: DOS magic mismatch in dump thread");
+        return 0;
+    }
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)moduleBase + pDos->e_lfanew);
-    if (pNt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        DebugLog("ERR: NT signature mismatch in dump thread");
+        return 0;
+    }
     DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
     snprintf(logBuf, sizeof(logBuf), "Size: %.1f MB", imageSize / 1048576.0);
     DebugLog(logBuf);
+    DebugLogFmt("Sections: %d, Headers: %lu bytes",
+                pNt->FileHeader.NumberOfSections,
+                (unsigned long)pNt->OptionalHeader.SizeOfHeaders);
 
     g_decryptGadget = NULL;
     LPBYTE base = (LPBYTE)moduleBase;
 
     /* 1. Try hardcoded RVA for the known build */
+    DebugLog("Gadget: trying hardcoded RVA");
     {
         LPBYTE p = base + DECRYPT_GADGET_RVA;
         if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x01 && p[3] == 0xC3)
             g_decryptGadget = (DecryptGadgetFunc)p;
     }
+    if (g_decryptGadget)
+        DebugLog("Gadget: found at hardcoded RVA");
+    else
+        DebugLog("Gadget: hardcoded RVA miss, scanning...");
 
     /* 2. Scan up to 16 MB for any matching gadget pattern */
     DWORD scanLimit = imageSize < 0x1000000 ? imageSize : 0x1000000;
@@ -2262,7 +2319,12 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
 
     /* 3. If no gadget found, attempt XOR key detection */
     if (!g_decryptGadget) {
+        DebugLog("Gadget: not found, trying XOR key detection");
         DetectXorKey(moduleBase, imageSize);
+        if (g_xorKey)
+            DebugLogFmt("XOR key detected: 0x%016llX", (unsigned long long)g_xorKey);
+        else
+            DebugLog("XOR key: not detected");
     }
     
     if (g_decryptGadget)
@@ -2270,14 +2332,18 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     else
         DebugLogFmt("Base: %p | Gadget: NOT FOUND - trying XOR detection", moduleBase);
     
+    DebugLog("Allocating dump buffer...");
     PVOID dumpBuffer = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!dumpBuffer) {
         DebugLogFmt("ERR: VirtualAlloc failed for dump buffer (%.1f MB) — out of memory?",
                     imageSize / 1048576.0);
         return 0;
     }
+    DebugLogFmt("Dump buffer allocated at %p", dumpBuffer);
     
+    DebugLog("Copying PE headers...");
     SpoofedMemcpy(dumpBuffer, moduleBase, pNt->OptionalHeader.SizeOfHeaders);
+    DebugLog("PE headers copied, starting section dump...");
     
     PIMAGE_SECTION_HEADER pSections = IMAGE_FIRST_SECTION(pNt);
     WORD numSections = pNt->FileHeader.NumberOfSections;
@@ -2292,11 +2358,20 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         DWORD secRVA = pSec->VirtualAddress;
         DWORD secSize = pSec->Misc.VirtualSize;
         if (secSize == 0) secSize = pSec->SizeOfRawData;
-        if (secSize == 0 || secRVA + secSize > imageSize) continue;
+        if (secSize == 0 || secRVA + secSize > imageSize) {
+            DebugLogFmt("  Section %s: SKIP (size=%lu rva=0x%X image=0x%X)",
+                        secName, (unsigned long)secSize, secRVA, imageSize);
+            continue;
+        }
         
         DWORD pagesCopied = 0, pagesForceDecrypted = 0;
         BOOL isCodeSection = (pSec->Characteristics & IMAGE_SCN_CNT_CODE) || 
                              (secName[0] == '.' && secName[1] == 't' && secName[2] == 'e');
+        
+        DebugLogFmt("  Section %s: rva=0x%X size=%lu (%s)%s",
+                    secName, secRVA, (unsigned long)secSize,
+                    isCodeSection ? "code" : "data",
+                    (pSec->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) ? " init" : "");
         
         DWORD pagesGadget = 0, pagesXor = 0, pagesPlain = 0;
 
@@ -2525,48 +2600,62 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
 
 static HMODULE g_ourModule = NULL;
 
-static void CALLBACK DeferredDumpCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Context) {
-    (void)Instance;
+static DWORD WINAPI DeferredDumpCallback(LPVOID Context) {
     (void)Context;
     
     PPEB peb = GET_PEB();
     PVOID moduleBase = peb ? peb->ImageBaseAddress : NULL;
-    if (!moduleBase) return;
-    
-    DebugLog("TLS scan: 2 min");
-    
-    const int TOTAL_WAIT_MS = 120000;
-    const int SCAN_INTERVAL_MS = 10;
-    const int TOTAL_ITERATIONS = TOTAL_WAIT_MS / SCAN_INTERVAL_MS;
-    
-    int lastCallbackCount = 0;
-    int lastLogSecond = -1;
-    
-    for (int i = 0; i < TOTAL_ITERATIONS; i++) {
-        ScanAndTrackTlsCallbacks(moduleBase);
-        
-        int currentSecond = (i * SCAN_INTERVAL_MS) / 1000;
-        
-        if (g_tlsTracker.count != lastCallbackCount) {
-            char logBuf[64];
-            snprintf(logBuf, sizeof(logBuf), "[%ds] TLS +1 = %d", currentSecond, g_tlsTracker.count);
-            DebugLog(logBuf);
-            lastCallbackCount = g_tlsTracker.count;
-        } else if (currentSecond != lastLogSecond && currentSecond % 30 == 0 && currentSecond > 0) {
-            char logBuf[32];
-            snprintf(logBuf, sizeof(logBuf), "[%ds] ...", currentSecond);
-            DebugLog(logBuf);
-            lastLogSecond = currentSecond;
-        }
-        
-        StealthSleep(SCAN_INTERVAL_MS);
+    if (!moduleBase) {
+        DebugLog("ERR: DeferredDumpCallback — no PEB/ImageBase");
+        return 0;
     }
     
+    /* TLS scan: watch for new TLS callbacks up to 30 s, then dump.
+     * On retail WoW, Warden kills us if we wait longer — dump fast. */
+    DebugLog("TLS scan: 30s max");
+
+    const int TOTAL_WAIT_MS  = 30000;
+    const int SCAN_INTERVAL_MS = 100;
+    const int TOTAL_ITERATIONS = TOTAL_WAIT_MS / SCAN_INTERVAL_MS;
+
+    int lastCallbackCount = g_tlsTracker.count;
+    int stableFor = 0; /* iterations without a new TLS callback */
+
+    for (int i = 0; i < TOTAL_ITERATIONS; i++) {
+        ScanAndTrackTlsCallbacks(moduleBase);
+
+        if (g_tlsTracker.count != lastCallbackCount) {
+            char logBuf[64];
+            int ms = i * SCAN_INTERVAL_MS;
+            snprintf(logBuf, sizeof(logBuf), "[%d.%ds] TLS +1 = %d",
+                     ms / 1000, (ms % 1000) / 100, g_tlsTracker.count);
+            DebugLog(logBuf);
+            lastCallbackCount = g_tlsTracker.count;
+            stableFor = 0;
+        } else {
+            stableFor++;
+        }
+
+        /* If TLS count has been stable for 5 s and we have at least 1
+         * callback, assume decryption is ready and dump immediately. */
+        if (lastCallbackCount > 0 && stableFor >= (5000 / SCAN_INTERVAL_MS))
+            break;
+
+        StealthSleep(SCAN_INTERVAL_MS);
+    }
+
+    DebugLogFmt("TLS stable at %d — dumping now", g_tlsTracker.count);
     DumpWorkerThread(NULL);
+    return 0;
 }
 
 static BOOL ScheduleDeferredDump(void) {
-    return TrySubmitThreadpoolCallback(DeferredDumpCallback, NULL, NULL);
+    /* Use the system threadpool — its threads start from ntdll addresses
+     * that pass Warden's thread-start-address scan.
+     * CreateThread with our own address fails because DeferredDumpCallback
+     * lives in an unregistered DLL, which Warden flags immediately. */
+    return TrySubmitThreadpoolCallback(
+        (PTP_SIMPLE_CALLBACK)DeferredDumpCallback, NULL, NULL);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
@@ -2577,12 +2666,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
         InitializeCriticalSection(&g_tlsLock);
         InitializeCriticalSection(&g_offsetLock);
         DisableThreadLibraryCalls(hModule);
-        
+
         PPEB peb = GET_PEB();
         if (peb && peb->ImageBaseAddress) {
             InitTlsCallbackTracking(peb->ImageBaseAddress);
         }
-        
         UnlinkFromPEB(hModule);
         
         char logBuf[64];
