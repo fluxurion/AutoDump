@@ -2097,6 +2097,8 @@ static void ExtractLoaderCrypto(uint8_t* dumpBuffer, DWORD imageSize) {
     CloseHandle(hFile);
 }
 
+static void GetExeVersionString(char *buf, size_t bufLen);
+
 static void DumpWowLoader(void) {
     char logBuf[256];
     
