@@ -2236,6 +2236,78 @@ static void DumpWowLoader(void) {
     VirtualFree(dumpBuffer, 0, MEM_RELEASE);
 }
 
+typedef struct {
+    DWORD dwSignature;
+    DWORD dwStrucVersion;
+    DWORD dwFileVersionMS;
+    DWORD dwFileVersionLS;
+    DWORD dwProductVersionMS;
+    DWORD dwProductVersionLS;
+    DWORD dwFileFlagsMask;
+    DWORD dwFileFlags;
+    DWORD dwFileOS;
+    DWORD dwFileType;
+    DWORD dwFileSubtype;
+    DWORD dwFileDateMS;
+    DWORD dwFileDateLS;
+} VS_FIXEDFILEINFO_LOCAL;
+
+static void GetExeVersionString(char *buf, size_t bufLen) {
+    buf[0] = '\0';
+
+    HMODULE hVer = LoadLibraryA("version.dll");
+    if (!hVer) goto fallback;
+
+    typedef DWORD (WINAPI *pfnGetSizeA)(LPCSTR, LPDWORD);
+    typedef BOOL  (WINAPI *pfnGetInfoA)(LPCSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL  (WINAPI *pfnQueryA)(LPCVOID, LPCSTR, LPVOID *, PUINT);
+
+    pfnGetSizeA  pGetSize = (pfnGetSizeA) GetProcAddress(hVer, "GetFileVersionInfoSizeA");
+    pfnGetInfoA  pGetInfo = (pfnGetInfoA) GetProcAddress(hVer, "GetFileVersionInfoA");
+    pfnQueryA    pQuery   = (pfnQueryA)   GetProcAddress(hVer, "VerQueryValueA");
+
+    if (!pGetSize || !pGetInfo || !pQuery) { FreeLibrary(hVer); goto fallback; }
+
+    char exePath[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH - 1)) { FreeLibrary(hVer); goto fallback; }
+
+    DWORD dummy  = 0;
+    DWORD viSize = pGetSize(exePath, &dummy);
+    if (viSize == 0) { FreeLibrary(hVer); goto fallback; }
+
+    void *viBuf = VirtualAlloc(NULL, viSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!viBuf) { FreeLibrary(hVer); goto fallback; }
+
+    if (pGetInfo(exePath, 0, viSize, viBuf)) {
+        VS_FIXEDFILEINFO_LOCAL *fi = NULL;
+        UINT fiLen = 0;
+        if (pQuery(viBuf, "\\", (void **)&fi, &fiLen) && fi) {
+            WORD maj = (WORD)(fi->dwFileVersionMS >> 16);
+            WORD min = (WORD)(fi->dwFileVersionMS & 0xFFFF);
+            WORD pat = (WORD)(fi->dwFileVersionLS >> 16);
+            WORD bld = (WORD)(fi->dwFileVersionLS & 0xFFFF);
+            snprintf(buf, bufLen, "%u.%u.%u.%u", maj, min, pat, bld);
+        }
+    }
+    VirtualFree(viBuf, 0, MEM_RELEASE);
+    FreeLibrary(hVer);
+    if (buf[0]) return;
+
+fallback:;
+    PPEB _peb = GET_PEB();
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)(_peb ? _peb->ImageBaseAddress : NULL);
+    if (pDos && pDos->e_magic == IMAGE_DOS_SIGNATURE) {
+        PIMAGE_NT_HEADERS pNt2 = (PIMAGE_NT_HEADERS)((LPBYTE)pDos + pDos->e_lfanew);
+        if (pNt2->Signature == IMAGE_NT_SIGNATURE) {
+            snprintf(buf, bufLen, "%u.%u",
+                     pNt2->OptionalHeader.MajorImageVersion,
+                     pNt2->OptionalHeader.MinorImageVersion);
+            return;
+        }
+    }
+    snprintf(buf, bufLen, "unknown");
+}
+
 static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     (void)lpParam;
     char logBuf[256];
