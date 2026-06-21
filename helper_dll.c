@@ -2206,7 +2206,15 @@ static void DumpWowLoader(void) {
     }
     pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
     
-    HANDLE hFile = CreateFileA(OutputPath("wow_loader_dump.bin"), GENERIC_WRITE, 0, NULL,
+    char loaderVerStr[64];
+    GetExeVersionString(loaderVerStr, sizeof(loaderVerStr));
+    char loaderDumpName[128];
+    if (loaderVerStr[0] && strcmp(loaderVerStr, "unknown") != 0)
+        snprintf(loaderDumpName, sizeof(loaderDumpName), "wow_loader_dump_%s.bin", loaderVerStr);
+    else
+        snprintf(loaderDumpName, sizeof(loaderDumpName), "wow_loader_dump.bin");
+
+    HANDLE hFile = CreateFileA(OutputPath(loaderDumpName), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     
     if (hFile != INVALID_HANDLE_VALUE) {
