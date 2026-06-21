@@ -2103,10 +2103,10 @@ static void DumpWowLoader(void) {
     char logBuf[256];
     
     PVOID loaderBase = FindModuleByName(L"Wow_loader.dll");
-    if (!loaderBase) {
-        loaderBase = FindModuleByName(L"WowT_loader.dll");
-        if (!loaderBase) return;
-    }
+    if (!loaderBase) loaderBase = FindModuleByName(L"WowT_loader.dll");
+    if (!loaderBase) loaderBase = FindModuleByName(L"WowClassic_loader.dll");
+    if (!loaderBase) loaderBase = FindModuleByName(L"WowClassicT_loader.dll");
+    if (!loaderBase) return;
     
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)loaderBase;
     if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return;
