@@ -2255,7 +2255,7 @@ typedef struct {
 static void GetExeVersionString(char *buf, size_t bufLen) {
     buf[0] = '\0';
 
-    HMODULE hVer = LoadLibraryA("version.dll");
+    HMODULE hVer = GetModuleHandleA("version.dll");
     if (!hVer) goto fallback;
 
     typedef DWORD (WINAPI *pfnGetSizeA)(LPCSTR, LPDWORD);
@@ -2266,17 +2266,17 @@ static void GetExeVersionString(char *buf, size_t bufLen) {
     pfnGetInfoA  pGetInfo = (pfnGetInfoA) GetProcAddress(hVer, "GetFileVersionInfoA");
     pfnQueryA    pQuery   = (pfnQueryA)   GetProcAddress(hVer, "VerQueryValueA");
 
-    if (!pGetSize || !pGetInfo || !pQuery) { FreeLibrary(hVer); goto fallback; }
+    if (!pGetSize || !pGetInfo || !pQuery) goto fallback;
 
     char exePath[MAX_PATH] = {0};
-    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH - 1)) { FreeLibrary(hVer); goto fallback; }
+    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH - 1)) goto fallback;
 
     DWORD dummy  = 0;
     DWORD viSize = pGetSize(exePath, &dummy);
-    if (viSize == 0) { FreeLibrary(hVer); goto fallback; }
+    if (viSize == 0) goto fallback;
 
     void *viBuf = VirtualAlloc(NULL, viSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!viBuf) { FreeLibrary(hVer); goto fallback; }
+    if (!viBuf) goto fallback;
 
     if (pGetInfo(exePath, 0, viSize, viBuf)) {
         VS_FIXEDFILEINFO_LOCAL *fi = NULL;
@@ -2290,7 +2290,6 @@ static void GetExeVersionString(char *buf, size_t bufLen) {
         }
     }
     VirtualFree(viBuf, 0, MEM_RELEASE);
-    FreeLibrary(hVer);
     if (buf[0]) return;
 
 fallback:;
@@ -2644,24 +2643,32 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         DebugLog("Could not parse sections for offset extraction");
     }
     
-    HANDLE hFile = StealthCreateFile(OutputPath("wow_dump.bin"));
+    char verStr[64];
+    GetExeVersionString(verStr, sizeof(verStr));
+    char dumpName[128];
+    if (verStr[0] && strcmp(verStr, "unknown") != 0)
+        snprintf(dumpName, sizeof(dumpName), "wow_dump_%s.bin", verStr);
+    else
+        snprintf(dumpName, sizeof(dumpName), "wow_dump.bin");
+    DebugLogFmt("Dump filename: %s", dumpName);
+
+    HANDLE hFile = StealthCreateFile(OutputPath(dumpName));
     BOOL useStealth = (hFile != INVALID_HANDLE_VALUE);
 
     if (!useStealth) {
-        hFile = CreateFileA(OutputPath("wow_dump.bin"), GENERIC_WRITE, 0, NULL,
+        hFile = CreateFileA(OutputPath(dumpName), GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     }
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        DebugLogFmt("ERR: Failed to create wow_dump.bin at '%s' (WinError %lu)",
-                    OutputPath("wow_dump.bin"), GetLastError());
+        DebugLogFmt("ERR: Failed to create %s (WinError %lu)", dumpName, GetLastError());
         DebugLog("ERR: Possible causes: path does not exist, access denied, or disk full");
         SecureZeroBuffer(dumpBuffer, imageSize);
         VirtualFree(dumpBuffer, 0, MEM_RELEASE);
         return 0;
     }
-    DebugLogFmt("wow_dump.bin opened OK (stealth=%d) at: %s", useStealth, OutputPath("wow_dump.bin"));
-    
+    DebugLogFmt("%s opened OK (stealth=%d) at: %s", dumpName, useStealth, OutputPath(dumpName));
+
     DWORD written = 0;
     BOOL ok = useStealth ? 
         StealthWriteFile(hFile, dumpBuffer, imageSize, &written) :
@@ -2669,7 +2676,7 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     
     useStealth ? StealthCloseFile(hFile) : CloseHandle(hFile);
     
-    snprintf(logBuf, sizeof(logBuf), "wow_dump.bin: %lu bytes %s", written, ok ? "OK" : "FAIL");
+    snprintf(logBuf, sizeof(logBuf), "%s: %lu bytes %s", dumpName, written, ok ? "OK" : "FAIL");
     DebugLog(logBuf);
     
     SecureZeroBuffer(dumpBuffer, imageSize);
