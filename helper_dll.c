@@ -2204,7 +2204,12 @@ static void DumpWowLoader(void) {
         pSec->PointerToRawData = pSec->VirtualAddress;
         pSec->SizeOfRawData = pSec->Misc.VirtualSize;
     }
-    pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
+    pDumpNt->OptionalHeader.FileAlignment = 0x200;
+    {
+        DWORD sa = pDumpNt->OptionalHeader.SectionAlignment;
+        if (sa == 0 || sa > 0x200000 || (sa & (sa - 1)) != 0)
+            pDumpNt->OptionalHeader.SectionAlignment = 0x1000;
+    }
     
     HANDLE hFile = CreateFileA(OutputPath("wow_loader_dump.bin"), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2224,6 +2229,54 @@ static void DumpWowLoader(void) {
     
     SecureZeroBuffer(dumpBuffer, imageSize);
     VirtualFree(dumpBuffer, 0, MEM_RELEASE);
+}
+
+/* Reads the FileVersion from the running executable and writes it into
+ * buf as "major.minor.patch.build" (e.g. "8.3.7.35662").
+ * Falls back to MajorImageVersion.MinorImageVersion if unavailable. */
+static void GetExeVersionString(char *buf, size_t bufLen) {
+    buf[0] = '\0';
+
+    /* Get the executable path via GetModuleFileNameA */
+    char exePath[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH - 1)) goto fallback;
+
+    /* Query version info size */
+    DWORD dummy = 0;
+    DWORD viSize = GetFileVersionInfoSizeA(exePath, &dummy);
+    if (viSize == 0) goto fallback;
+
+    void *viBuf = VirtualAlloc(NULL, viSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!viBuf) goto fallback;
+
+    if (GetFileVersionInfoA(exePath, 0, viSize, viBuf)) {
+        VS_FIXEDFILEINFO *fi = NULL;
+        UINT fiLen = 0;
+        if (VerQueryValueA(viBuf, "\\", (void**)&fi, &fiLen) && fi) {
+            WORD maj  = HIWORD(fi->dwFileVersionMS);
+            WORD min  = LOWORD(fi->dwFileVersionMS);
+            WORD pat  = HIWORD(fi->dwFileVersionLS);
+            WORD bld  = LOWORD(fi->dwFileVersionLS);
+            snprintf(buf, bufLen, "%u.%u.%u.%u", maj, min, pat, bld);
+        }
+    }
+    VirtualFree(viBuf, 0, MEM_RELEASE);
+    if (buf[0]) return;
+
+fallback:;
+    /* Fallback: use PE optional header version fields */
+    PPEB _peb = GET_PEB();
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)(_peb ? _peb->ImageBaseAddress : NULL);
+    if (pDos && pDos->e_magic == IMAGE_DOS_SIGNATURE) {
+        PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)pDos + pDos->e_lfanew);
+        if (pNt->Signature == IMAGE_NT_SIGNATURE) {
+            snprintf(buf, bufLen, "%u.%u",
+                     pNt->OptionalHeader.MajorImageVersion,
+                     pNt->OptionalHeader.MinorImageVersion);
+            return;
+        }
+    }
+    snprintf(buf, bufLen, "unknown");
 }
 
 static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
@@ -2267,11 +2320,31 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         return 0;
     }
     DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
+    /* Some builds (e.g. BFA 8.3.7) corrupt SizeOfHeaders after load as an
+     * anti-dump measure. Compute the real header size from the first
+     * section's raw address, and cap to a sane maximum. */
+    DWORD headerSize = pNt->OptionalHeader.SizeOfHeaders;
+    PIMAGE_SECTION_HEADER _pSec0 = IMAGE_FIRST_SECTION(pNt);
+    DWORD firstSecRaw = _pSec0->PointerToRawData;
+    DWORD firstSecVA  = _pSec0->VirtualAddress;
+    DWORD realHeaderSize = firstSecRaw ? firstSecRaw : firstSecVA;
+    if (realHeaderSize > 0 && realHeaderSize < imageSize)
+        headerSize = realHeaderSize;
+    else
+        headerSize = 0x1000; /* fallback: 4 KB */
+    if (pNt->OptionalHeader.SizeOfHeaders > imageSize) {
+        DebugLogFmt("SizeOfHeaders corrupted (%lu) — using %lu",
+                    (unsigned long)pNt->OptionalHeader.SizeOfHeaders,
+                    (unsigned long)headerSize);
+        /* Do NOT write back to pNt — that modifies the live image and
+         * triggers anti-tamper. We use headerSize locally for the copy,
+         * and FixupDumpedPE will correct it in the dump buffer. */
+    }
     snprintf(logBuf, sizeof(logBuf), "Size: %.1f MB", imageSize / 1048576.0);
     DebugLog(logBuf);
     DebugLogFmt("Sections: %d, Headers: %lu bytes",
                 pNt->FileHeader.NumberOfSections,
-                (unsigned long)pNt->OptionalHeader.SizeOfHeaders);
+                (unsigned long)headerSize);
 
     g_decryptGadget = NULL;
     LPBYTE base = (LPBYTE)moduleBase;
@@ -2341,8 +2414,8 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     }
     DebugLogFmt("Dump buffer allocated at %p", dumpBuffer);
     
-    DebugLog("Copying PE headers...");
-    SpoofedMemcpy(dumpBuffer, moduleBase, pNt->OptionalHeader.SizeOfHeaders);
+    DebugLogFmt("Copying PE headers (%lu bytes)...", (unsigned long)headerSize);
+    SpoofedMemcpy(dumpBuffer, moduleBase, headerSize);
     DebugLog("PE headers copied, starting section dump...");
     
     PIMAGE_SECTION_HEADER pSections = IMAGE_FIRST_SECTION(pNt);
@@ -2469,7 +2542,25 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
             pSec->PointerToRawData = pSec->VirtualAddress;
             pSec->SizeOfRawData    = pSec->Misc.VirtualSize;
         }
-        pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
+        pDumpNt->OptionalHeader.FileAlignment  = 0x200;   /* standard file alignment */
+        /* Fix corrupted SectionAlignment (BFA anti-dump: 0x6FE4B07E etc.) */
+        DWORD secAlign = pDumpNt->OptionalHeader.SectionAlignment;
+        if (secAlign == 0 || secAlign > 0x200000 ||
+            (secAlign & (secAlign - 1)) != 0) /* not a power of 2 */
+            pDumpNt->OptionalHeader.SectionAlignment = 0x1000;
+
+        /* 1b. Fix corrupted fields (BFA 8.3.7 anti-dump) */
+        if (pDumpNt->OptionalHeader.SizeOfHeaders > pDumpNt->OptionalHeader.SizeOfImage) {
+            DWORD fixHdr = pDumpSections[0].VirtualAddress;
+            if (fixHdr == 0) fixHdr = 0x1000;
+            pDumpNt->OptionalHeader.SizeOfHeaders = fixHdr;
+            DebugLogFmt("SizeOfHeaders fixed in dump: %lu", (unsigned long)fixHdr);
+        }
+        if (pDumpNt->OptionalHeader.AddressOfEntryPoint >= pDumpNt->OptionalHeader.SizeOfImage) {
+            DebugLogFmt("AddressOfEntryPoint corrupted (0x%X) — zeroed",
+                        pDumpNt->OptionalHeader.AddressOfEntryPoint);
+            pDumpNt->OptionalHeader.AddressOfEntryPoint = 0;
+        }
 
         /* 2. Reset ImageBase to a conventional 64-bit base so IDA
          *    loads at a predictable address instead of the runtime VA. */
@@ -2500,7 +2591,12 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
             DebugLog("pdata: directory zeroed (encrypted unwind info)");
         }
 
-        /* 5. Zero the DLL flag so IDA treats it as an EXE */
+        /* 5. Ensure correct machine type and clear DLL flag */
+        if (pDumpNt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+            DebugLogFmt("Machine corrupted (0x%04X) — forcing AMD64",
+                        pDumpNt->FileHeader.Machine);
+            pDumpNt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        }
         pDumpNt->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
 
         DebugLog("PE fixup done: ImageBase=0x140000000, reloc/debug/security/pdata zeroed");
@@ -2562,23 +2658,32 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         DebugLog("Could not parse sections for offset extraction");
     }
     
-    HANDLE hFile = StealthCreateFile(OutputPath("wow_dump.bin"));
+    /* Build versioned filename: wow_dump_8.3.7.35662.bin */
+    char verStr[64];
+    GetExeVersionString(verStr, sizeof(verStr));
+    char dumpName[128];
+    if (verStr[0] && strcmp(verStr, "unknown") != 0)
+        snprintf(dumpName, sizeof(dumpName), "wow_dump_%s.bin", verStr);
+    else
+        snprintf(dumpName, sizeof(dumpName), "wow_dump.bin");
+    DebugLogFmt("Dump filename: %s", dumpName);
+
+    HANDLE hFile = StealthCreateFile(OutputPath(dumpName));
     BOOL useStealth = (hFile != INVALID_HANDLE_VALUE);
 
     if (!useStealth) {
-        hFile = CreateFileA(OutputPath("wow_dump.bin"), GENERIC_WRITE, 0, NULL,
+        hFile = CreateFileA(OutputPath(dumpName), GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     }
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        DebugLogFmt("ERR: Failed to create wow_dump.bin at '%s' (WinError %lu)",
-                    OutputPath("wow_dump.bin"), GetLastError());
+        DebugLogFmt("ERR: Failed to create %s (WinError %lu)", dumpName, GetLastError());
         DebugLog("ERR: Possible causes: path does not exist, access denied, or disk full");
         SecureZeroBuffer(dumpBuffer, imageSize);
         VirtualFree(dumpBuffer, 0, MEM_RELEASE);
         return 0;
     }
-    DebugLogFmt("wow_dump.bin opened OK (stealth=%d) at: %s", useStealth, OutputPath("wow_dump.bin"));
+    DebugLogFmt("%s opened OK (stealth=%d) at: %s", dumpName, useStealth, OutputPath(dumpName));
     
     DWORD written = 0;
     BOOL ok = useStealth ? 
@@ -2587,7 +2692,7 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
     
     useStealth ? StealthCloseFile(hFile) : CloseHandle(hFile);
     
-    snprintf(logBuf, sizeof(logBuf), "wow_dump.bin: %lu bytes %s", written, ok ? "OK" : "FAIL");
+    snprintf(logBuf, sizeof(logBuf), "%s: %lu bytes %s", dumpName, written, ok ? "OK" : "FAIL");
     DebugLog(logBuf);
     
     SecureZeroBuffer(dumpBuffer, imageSize);

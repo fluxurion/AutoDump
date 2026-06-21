@@ -27,7 +27,7 @@ if %errorlevel% equ 0 (
 
 echo.
 echo [2/3] Compiling helper.dll ...
-%CC% %CFLAGS% -shared -o helper.dll helper_dll.c
+%CC% %CFLAGS% -shared -o helper.dll helper_dll.c -lversion
 if %errorlevel% equ 0 (
     echo   [+] helper.dll created successfully
 ) else (
