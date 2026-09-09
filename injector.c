@@ -14,18 +14,6 @@ typedef LONG NTSTATUS;
 #define MAGIC_OUTPUT_DIR 0x525449525450554fULL
 
 
-#define SYS_NtAllocateVirtualMemory 0x0018
-#define SYS_NtWriteVirtualMemory 0x003A
-#define SYS_NtProtectVirtualMemory 0x0050
-#define SYS_NtReadVirtualMemory 0x003F
-#define SYS_NtFreeVirtualMemory 0x001F
-#define SYS_NtOpenProcess 0x0026
-#define SYS_NtOpenThread 0x00C5
-#define SYS_NtSuspendThread 0x00C7
-#define SYS_NtResumeThread 0x00C8
-#define SYS_NtGetContextThread 0x00F7
-#define SYS_NtSetContextThread 0x00F8
-
 typedef struct _CLIENT_ID {
     PVOID UniqueProcess;
     PVOID UniqueThread;

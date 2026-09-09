@@ -252,21 +252,33 @@ static BOOL CopyPageAfterTouch(PVOID srcPage, PVOID dstBuffer) {
  */
 static int ScoreAsCode(const uint8_t* buf, DWORD len) {
     int score = 0;
-    for (DWORD i = 0; i < len && i < 256; i++) {
+    DWORD cap = len < 1024 ? len : 1024;
+    for (DWORD i = 0; i < cap; i++) {
         uint8_t b = buf[i];
         if (b == 0x48 || b == 0x4C || b == 0x41 || b == 0x45 || b == 0x40 ||
             b == 0xE8 || b == 0xFF || b == 0x8B || b == 0x89 || b == 0x0F ||
-            b == 0x55 || b == 0x53 || b == 0x56 || b == 0x57 || b == 0xC3)
+            b == 0x55 || b == 0x53 || b == 0x56 || b == 0x57 || b == 0xC3 ||
+            b == 0x83 || b == 0x31 || b == 0x33 || b == 0xB8 || b == 0xE9 ||
+            b == 0x44 || b == 0x49 || b == 0x50 || b == 0x5B || b == 0x5D)
             score++;
     }
     return score;
 }
 
 /*
- * Try to derive the XOR key by looking at a readable code page that is
- * immediately adjacent to a PAGE_NOACCESS page. We XOR candidate 8-byte
- * keys (sampled from the readable page itself at aligned offsets) against
- * the first 256 bytes of the protected page and score the result.
+ * DetectXorKey — dynamically discover the 8-byte XOR key used to
+ * protect code pages. The approach:
+ *
+ *   1. Collect candidate 8-byte keys from multiple sources:
+ *      - Readable code pages (already-decrypted code regions)
+ *      - .rdata section (encryption keys are often stored there)
+ *   2. Find encrypted code pages (low ScoreAsCode) by temporarily
+ *      unprotecting them with PAGE_EXECUTE_READWRITE.
+ *   3. XOR each candidate against the encrypted page and score the
+ *      result. The best-scoring candidate above threshold wins.
+ *
+ * This replaces the old approach which only checked the first code
+ * section and tried only 64 candidates from a single adjacent page.
  */
 static BOOL DetectXorKey(PVOID moduleBase, DWORD imageSize) {
     if (g_xorReady) return g_xorKey != 0;
@@ -277,73 +289,142 @@ static BOOL DetectXorKey(PVOID moduleBase, DWORD imageSize) {
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)moduleBase + pDos->e_lfanew);
     PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
 
-    /* Find first readable code section page to use as plaintext reference */
-    uint8_t* plainPage = NULL;
-    uint8_t* encPage   = NULL;
+    /* ── Phase 1: Collect candidate keys ── */
+    #define MAX_KEY_CANDIDATES 1024
+    UINT64 candidates[MAX_KEY_CANDIDATES];
+    int candidateCount = 0;
+    UINT64 imgBase = (UINT64)moduleBase;
 
-    for (WORD s = 0; s < pNt->FileHeader.NumberOfSections && !encPage; s++) {
+    /* Source A: 8-byte aligned chunks from readable code pages */
+    for (WORD s = 0; s < pNt->FileHeader.NumberOfSections && candidateCount < 600; s++) {
         if (!(pSec[s].Characteristics & IMAGE_SCN_CNT_CODE)) continue;
         DWORD secRVA  = pSec[s].VirtualAddress;
         DWORD secSize = pSec[s].Misc.VirtualSize;
         if (!secSize) secSize = pSec[s].SizeOfRawData;
 
-        for (DWORD off = 0; off + 8192 < secSize; off += 4096) {
-            uint8_t* pg1 = (uint8_t*)moduleBase + secRVA + off;
-            uint8_t* pg2 = (uint8_t*)moduleBase + secRVA + off + 4096;
-            MEMORY_BASIC_INFORMATION m1, m2;
-            if (!VirtualQuery(pg1, &m1, sizeof(m1))) continue;
-            if (!VirtualQuery(pg2, &m2, sizeof(m2))) continue;
-            BOOL r1 = (m1.Protect & PAGE_EXECUTE_READ) || (m1.Protect & PAGE_EXECUTE_READWRITE) ||
-                      (m1.Protect & PAGE_READONLY)     || (m1.Protect & PAGE_READWRITE);
-            BOOL r2 = (m2.Protect == PAGE_NOACCESS || m2.Protect == 0);
-            if (r1 && r2) { plainPage = pg1; encPage = pg2; break; }
+        for (DWORD off = 0; off + 4096 <= secSize && candidateCount < 600; off += 4096) {
+            uint8_t* pg = (uint8_t*)moduleBase + secRVA + off;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(pg, &mbi, sizeof(mbi))) continue;
+            BOOL readable = (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                            PAGE_READONLY | PAGE_READWRITE)) != 0;
+            if (!readable || (mbi.Protect & PAGE_GUARD)) continue;
+
+            /* Only use pages that already look like valid code */
+            if (ScoreAsCode(pg, 256) < 20) continue;
+
+            for (int k = 0; k < 64 && candidateCount < 600; k++) {
+                UINT64 candidate;
+                memcpy(&candidate, pg + k * 8, 8);
+                if (candidate == 0 || candidate == 0xFFFFFFFFFFFFFFFFULL) continue;
+                /* Skip values that look like pointers into the image */
+                if (candidate >= imgBase && candidate < imgBase + imageSize) continue;
+                candidates[candidateCount++] = candidate;
+            }
         }
     }
 
-    if (!plainPage || !encPage) return FALSE;
+    /* Source B: 8-byte values from .rdata (keys are often stored there) */
+    for (WORD s = 0; s < pNt->FileHeader.NumberOfSections && candidateCount < MAX_KEY_CANDIDATES; s++) {
+        char secName[9] = {0};
+        memcpy(secName, pSec[s].Name, 8);
+        if (strcmp(secName, ".rdata") != 0) continue;
+        DWORD secRVA  = pSec[s].VirtualAddress;
+        DWORD secSize = pSec[s].Misc.VirtualSize;
+        if (!secSize) secSize = pSec[s].SizeOfRawData;
 
-    /* Score the encrypted page raw (should be low for truly encrypted data).
-     * Use VirtualQuery to confirm the page is accessible before reading. */
-    MEMORY_BASIC_INFORMATION encMbi;
-    if (!VirtualQuery(encPage, &encMbi, sizeof(encMbi))) return FALSE;
-    if (encMbi.Protect == PAGE_NOACCESS || encMbi.Protect == 0) {
-        DWORD oldProt;
-        if (!VirtualProtect(encPage, 256, PAGE_EXECUTE_READ, &oldProt)) return FALSE;
-        VirtualProtect(encPage, 256, oldProt, &oldProt);
-        if (!VirtualQuery(encPage, &encMbi, sizeof(encMbi))) return FALSE;
+        for (DWORD off = 0; off + 8 <= secSize && candidateCount < MAX_KEY_CANDIDATES; off += 8) {
+            uint8_t* p = (uint8_t*)moduleBase + secRVA + off;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(p, &mbi, sizeof(mbi))) continue;
+            BOOL readable = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE)) != 0;
+            if (!readable || (mbi.Protect & PAGE_GUARD)) continue;
+
+            UINT64 candidate;
+            memcpy(&candidate, p, 8);
+            /* Keys tend to be high-entropy, not small numbers or pointers */
+            if (candidate <= 0x100 || candidate == 0xFFFFFFFFFFFFFFFFULL) continue;
+            if (candidate >= imgBase && candidate < imgBase + imageSize) continue;
+            candidates[candidateCount++] = candidate;
+        }
     }
-    uint8_t tmp[256];
-    memcpy(tmp, encPage, 256);
-    if (ScoreAsCode(tmp, 256) > 40) {
-        /* Page looks like code already — no XOR needed */
+
+    if (candidateCount == 0) {
+        DebugLog("XOR key: no candidates collected");
         return FALSE;
     }
 
-    /* Try each 8-byte aligned chunk of the readable page as a candidate key */
+    /* ── Phase 2: Test candidates against encrypted code pages ── */
     int bestScore = 0;
     UINT64 bestKey = 0;
-    int k;
-    for (k = 0; k < 64; k++) {
-        UINT64 candidate;
-        memcpy(&candidate, plainPage + k * 8, 8);
-        if (!candidate) continue;
-        uint8_t decoded[256];
-        int i;
-        for (i = 0; i < 32; i++) {
-            UINT64 enc;
-            memcpy(&enc, tmp + i * 8, 8);
-            UINT64 dec = enc ^ candidate;
-            memcpy(decoded + i * 8, &dec, 8);
+    int pagesTested = 0;
+
+    for (WORD s = 0; s < pNt->FileHeader.NumberOfSections; s++) {
+        if (!(pSec[s].Characteristics & IMAGE_SCN_CNT_CODE)) continue;
+        DWORD secRVA  = pSec[s].VirtualAddress;
+        DWORD secSize = pSec[s].Misc.VirtualSize;
+        if (!secSize) secSize = pSec[s].SizeOfRawData;
+
+        for (DWORD off = 0; off + 4096 <= secSize; off += 4096) {
+            uint8_t* pg = (uint8_t*)moduleBase + secRVA + off;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(pg, &mbi, sizeof(mbi))) continue;
+
+            BOOL wasProtected = (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0);
+            DWORD oldProt = 0;
+
+            if (wasProtected) {
+                if (!VirtualProtect(pg, 4096, PAGE_EXECUTE_READWRITE, &oldProt)) continue;
+            } else if (mbi.Protect & PAGE_GUARD) {
+                continue;
+            }
+
+            /* Read a sample from the page */
+            uint8_t sample[256];
+            memcpy(sample, pg, 256);
+
+            if (wasProtected) {
+                VirtualProtect(pg, 4096, oldProt, &oldProt);
+            }
+
+            /* Skip pages that already look like valid code */
+            if (ScoreAsCode(sample, 256) > 40) continue;
+
+            pagesTested++;
+
+            /* Try each candidate key */
+            for (int c = 0; c < candidateCount; c++) {
+                uint8_t decoded[256];
+                for (int i = 0; i < 32; i++) {
+                    UINT64 enc;
+                    memcpy(&enc, sample + i * 8, 8);
+                    UINT64 dec = enc ^ candidates[c];
+                    memcpy(decoded + i * 8, &dec, 8);
+                }
+                int sc = ScoreAsCode(decoded, 256);
+                if (sc > bestScore) {
+                    bestScore = sc;
+                    bestKey = candidates[c];
+                }
+            }
+
+            /* If we already have a very strong match, stop early */
+            if (bestScore >= 60) break;
         }
-        int sc = ScoreAsCode(decoded, 256);
-        if (sc > bestScore) { bestScore = sc; bestKey = candidate; }
+        if (bestScore >= 60) break;
     }
 
-    if (bestScore >= 20 && bestKey) {
+    #undef MAX_KEY_CANDIDATES
+
+    if (bestScore >= 25 && bestKey) {
         g_xorKey = bestKey;
-        DebugLogFmt("XOR key detected: 0x%016llX (score=%d)", (unsigned long long)bestKey, bestScore);
+        DebugLogFmt("XOR key detected: 0x%016llX (score=%d, candidates=%d, pages=%d)",
+                    (unsigned long long)bestKey, bestScore, candidateCount, pagesTested);
         return TRUE;
     }
+
+    DebugLogFmt("XOR key: not detected (best=%d, candidates=%d, pages=%d)",
+                bestScore, candidateCount, pagesTested);
     return FALSE;
 }
 
@@ -356,21 +437,26 @@ static BOOL TryXorDecryptPage(PVOID srcPage, PVOID dstBuffer) {
     return TRUE;
 }
 
-#define SYS_NtOpenThread 0x00C5
-#define SYS_NtSuspendThread 0x00C7
-#define SYS_NtResumeThread 0x00C8
-#define SYS_NtGetContextThread 0x00F7
-#define SYS_NtSetContextThread 0x00F8
-#define SYS_NtAllocateVirtualMemory 0x0018
-#define SYS_NtWriteVirtualMemory 0x003A
-#define SYS_NtReadVirtualMemory 0x003F
-#define SYS_NtProtectVirtualMemory 0x0050
-#define SYS_NtFreeVirtualMemory 0x001F
-#define SYS_NtCreateFile 0x0055
-#define SYS_NtWriteFile 0x0008
-#define SYS_NtClose 0x000F
-#define SYS_NtDelayExecution 0x0034
-#define SYS_NtQueryVirtualMemory 0x0023
+/* XOR-decrypt an arbitrary-size range. Handles non-8-byte-aligned
+ * tails by processing the remainder byte-by-byte against the key. */
+static BOOL TryXorDecryptRange(PVOID src, PVOID dst, DWORD size) {
+    if (!g_xorKey) return FALSE;
+    UINT64 key = g_xorKey;
+    UINT64* src64 = (UINT64*)src;
+    UINT64* dst64 = (UINT64*)dst;
+    DWORD fullChunks = size / 8;
+    for (DWORD i = 0; i < fullChunks; i++)
+        dst64[i] = src64[i] ^ key;
+    DWORD remaining = size & 7;
+    if (remaining) {
+        uint8_t* key8 = (uint8_t*)&key;
+        uint8_t* src8 = (uint8_t*)(src64 + fullChunks);
+        uint8_t* dst8 = (uint8_t*)(dst64 + fullChunks);
+        for (DWORD i = 0; i < remaining; i++)
+            dst8[i] = src8[i] ^ key8[i];
+    }
+    return TRUE;
+}
 
 typedef LONG NTSTATUS;
 #define STATUS_SUCCESS 0x00000000
@@ -399,6 +485,126 @@ typedef struct _OBJECT_ATTRIBUTES {
 } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
 #ifdef _WIN64
+
+/* ── Dynamic SSN (System Service Number) resolution ──
+ *
+ * Hardcoded SSNs break across Windows builds. We parse ntdll.dll's
+ * export table at runtime and extract each Nt* function's SSN from
+ * its syscall stub. If a stub is hooked (patched with a jmp by an
+ * EDR/anti-cheat), we use the Halo's Gate technique: walk to
+ * adjacent unhooked stubs and compute the SSN by relative offset. */
+
+typedef struct {
+    DWORD NtOpenThread;
+    DWORD NtSuspendThread;
+    DWORD NtResumeThread;
+    DWORD NtGetContextThread;
+    DWORD NtSetContextThread;
+    DWORD NtAllocateVirtualMemory;
+    DWORD NtWriteVirtualMemory;
+    DWORD NtReadVirtualMemory;
+    DWORD NtProtectVirtualMemory;
+    DWORD NtFreeVirtualMemory;
+    DWORD NtCreateFile;
+    DWORD NtWriteFile;
+    DWORD NtClose;
+    DWORD NtDelayExecution;
+    DWORD NtQueryVirtualMemory;
+} SSN_TABLE;
+
+static SSN_TABLE g_ssn = {0};
+static BOOL g_ssnResolved = FALSE;
+
+/* Extract SSN from an unhooked syscall stub:
+ *   4C 8B D1          mov r10, rcx
+ *   B8 xx xx 00 00    mov eax, SSN
+ * Returns TRUE and fills *ssn if the stub is unhooked. */
+static BOOL ExtractSsnDirect(LPBYTE funcAddr, DWORD* ssn) {
+    if (funcAddr[0] == 0x4C && funcAddr[1] == 0x8B &&
+        funcAddr[2] == 0xD1 && funcAddr[3] == 0xB8) {
+        *ssn = *(DWORD*)(funcAddr + 4);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Halo's Gate: for a hooked stub, walk adjacent stubs (typically 0x20
+ * bytes apart in ntdll) and compute the SSN by relative distance.
+ * Syscall numbers are sequential, so if an unhooked neighbor at
+ * distance N has SSN S, the target's SSN is S +/- N. */
+static BOOL ExtractSsnHalo(LPBYTE funcAddr, DWORD* ssn) {
+    for (int distance = 1; distance < 500; distance++) {
+        DWORD neighborSsn;
+        LPBYTE neighbor = funcAddr - (distance * 0x20);
+        if (ExtractSsnDirect(neighbor, &neighborSsn)) {
+            *ssn = neighborSsn + distance;
+            return TRUE;
+        }
+        neighbor = funcAddr + (distance * 0x20);
+        if (ExtractSsnDirect(neighbor, &neighborSsn)) {
+            *ssn = neighborSsn - distance;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL ResolveOneSsn(PVOID ntdllBase, const char* funcName, DWORD* outSsn) {
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)ntdllBase;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)ntdllBase + pDos->e_lfanew);
+    DWORD expRva = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!expRva) return FALSE;
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)((LPBYTE)ntdllBase + expRva);
+    DWORD* addrTable = (DWORD*)((LPBYTE)ntdllBase + pExp->AddressOfFunctions);
+    DWORD* nameTable = (DWORD*)((LPBYTE)ntdllBase + pExp->AddressOfNames);
+    WORD* ordTable = (WORD*)((LPBYTE)ntdllBase + pExp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < pExp->NumberOfNames; i++) {
+        const char* name = (const char*)((LPBYTE)ntdllBase + nameTable[i]);
+        if (strcmp(name, funcName) != 0) continue;
+
+        LPBYTE funcAddr = (LPBYTE)ntdllBase + addrTable[ordTable[i]];
+
+        if (ExtractSsnDirect(funcAddr, outSsn)) return TRUE;
+        if (ExtractSsnHalo(funcAddr, outSsn)) return TRUE;
+        return FALSE;
+    }
+    return FALSE;
+}
+
+static BOOL ResolveAllSsns(void) {
+    if (g_ssnResolved) return TRUE;
+
+    PVOID ntdll = (PVOID)GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return FALSE;
+
+    BOOL ok = TRUE;
+    ok &= ResolveOneSsn(ntdll, "NtOpenThread",            &g_ssn.NtOpenThread);
+    ok &= ResolveOneSsn(ntdll, "NtSuspendThread",         &g_ssn.NtSuspendThread);
+    ok &= ResolveOneSsn(ntdll, "NtResumeThread",          &g_ssn.NtResumeThread);
+    ok &= ResolveOneSsn(ntdll, "NtGetContextThread",      &g_ssn.NtGetContextThread);
+    ok &= ResolveOneSsn(ntdll, "NtSetContextThread",      &g_ssn.NtSetContextThread);
+    ok &= ResolveOneSsn(ntdll, "NtAllocateVirtualMemory", &g_ssn.NtAllocateVirtualMemory);
+    ok &= ResolveOneSsn(ntdll, "NtWriteVirtualMemory",    &g_ssn.NtWriteVirtualMemory);
+    ok &= ResolveOneSsn(ntdll, "NtReadVirtualMemory",     &g_ssn.NtReadVirtualMemory);
+    ok &= ResolveOneSsn(ntdll, "NtProtectVirtualMemory",  &g_ssn.NtProtectVirtualMemory);
+    ok &= ResolveOneSsn(ntdll, "NtFreeVirtualMemory",     &g_ssn.NtFreeVirtualMemory);
+    ok &= ResolveOneSsn(ntdll, "NtCreateFile",            &g_ssn.NtCreateFile);
+    ok &= ResolveOneSsn(ntdll, "NtWriteFile",             &g_ssn.NtWriteFile);
+    ok &= ResolveOneSsn(ntdll, "NtClose",                 &g_ssn.NtClose);
+    ok &= ResolveOneSsn(ntdll, "NtDelayExecution",        &g_ssn.NtDelayExecution);
+    ok &= ResolveOneSsn(ntdll, "NtQueryVirtualMemory",    &g_ssn.NtQueryVirtualMemory);
+
+    g_ssnResolved = TRUE;
+
+    DebugLogFmt("SSN: resolved=%d NtOpenThread=0x%X NtAlloc=0x%X NtWrite=0x%X NtProtect=0x%X",
+                ok, g_ssn.NtOpenThread, g_ssn.NtAllocateVirtualMemory,
+                g_ssn.NtWriteVirtualMemory, g_ssn.NtProtectVirtualMemory);
+
+    return ok;
+}
+
 NTSTATUS NtOpenThread(
     PHANDLE ThreadHandle,
     ACCESS_MASK DesiredAccess,
@@ -412,10 +618,10 @@ NTSTATUS NtOpenThread(
     register PCLIENT_ID r9_val asm("r9") = ClientId;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x00C5, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtOpenThread)
         : "r10", "r11", "memory"
     );
     return status;
@@ -428,10 +634,10 @@ NTSTATUS NtSuspendThread(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x00C7, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (ThreadHandle), "d" (SuspendCount)
+        : "c" (ThreadHandle), "d" (SuspendCount), "g" (g_ssn.NtSuspendThread)
         : "r10", "r11", "memory"
     );
     return status;
@@ -444,10 +650,10 @@ NTSTATUS NtResumeThread(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x00C8, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (ThreadHandle), "d" (SuspendCount)
+        : "c" (ThreadHandle), "d" (SuspendCount), "g" (g_ssn.NtResumeThread)
         : "r10", "r11", "memory"
     );
     return status;
@@ -460,10 +666,10 @@ NTSTATUS NtGetContextThread(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x00F7, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (ThreadHandle), "d" (Context)
+        : "c" (ThreadHandle), "d" (Context), "g" (g_ssn.NtGetContextThread)
         : "r10", "r11", "memory"
     );
     return status;
@@ -476,10 +682,10 @@ NTSTATUS NtSetContextThread(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x00F8, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (ThreadHandle), "d" (Context)
+        : "c" (ThreadHandle), "d" (Context), "g" (g_ssn.NtSetContextThread)
         : "r10", "r11", "memory"
     );
     return status;
@@ -501,10 +707,10 @@ NTSTATUS NtAllocateVirtualMemory(
     register PSIZE_T r9_val asm("r9") = RegionSize;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x0018, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtAllocateVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -525,10 +731,10 @@ NTSTATUS NtWriteVirtualMemory(
     register SIZE_T r9_val asm("r9") = BufferSize;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x003A, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtWriteVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -549,10 +755,10 @@ NTSTATUS NtReadVirtualMemory(
     register SIZE_T r9_val asm("r9") = BufferSize;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x003F, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtReadVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -573,10 +779,10 @@ NTSTATUS NtProtectVirtualMemory(
     register ULONG r9_val asm("r9") = NewProtect;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x0050, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtProtectVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -595,10 +801,10 @@ NTSTATUS NtFreeVirtualMemory(
     register ULONG r9_val asm("r9") = FreeType;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x001F, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtFreeVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -640,10 +846,10 @@ NTSTATUS NtCreateFile(
     register PIO_STATUS_BLOCK r9_val asm("r9") = IoStatusBlock;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x0055, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtCreateFile)
         : "r10", "r11", "memory"
     );
     return status;
@@ -668,10 +874,10 @@ NTSTATUS NtWriteFile(
     register PVOID r9_val asm("r9") = ApcContext;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x0008, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtWriteFile)
         : "r10", "r11", "memory"
     );
     return status;
@@ -683,10 +889,10 @@ NTSTATUS NtClose(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x000F, %%eax\n\t"
+        "movl %2, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (Handle)
+        : "c" (Handle), "g" (g_ssn.NtClose)
         : "r10", "r11", "memory"
     );
     return status;
@@ -699,10 +905,10 @@ NTSTATUS NtDelayExecution(
     register NTSTATUS status asm("rax");
     __asm__ __volatile__ (
         "movq %%rcx, %%r10\n\t"
-        "movl $0x0034, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "c" (Alertable), "d" (DelayInterval)
+        : "c" (Alertable), "d" (DelayInterval), "g" (g_ssn.NtDelayExecution)
         : "r10", "r11", "memory"
     );
     return status;
@@ -731,10 +937,10 @@ NTSTATUS NtQueryVirtualMemory(
     register PVOID r9_val asm("r9") = MemoryInformation;
     __asm__ __volatile__ (
         "movq %1, %%r10\n\t"
-        "movl $0x0023, %%eax\n\t"
+        "movl %5, %%eax\n\t"
         "syscall\n\t"
         : "=a" (status)
-        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val)
+        : "r" (rcx_val), "r" (rdx_val), "r" (r8_val), "r" (r9_val), "g" (g_ssn.NtQueryVirtualMemory)
         : "r10", "r11", "memory"
     );
     return status;
@@ -2101,113 +2307,220 @@ static void GetExeVersionString(char *buf, size_t bufLen);
 
 static void DumpWowLoader(void) {
     char logBuf[256];
-    
+
     PVOID loaderBase = FindModuleByName(L"Wow_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowT_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowClassic_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowClassicT_loader.dll");
     if (!loaderBase) return;
-    
+
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)loaderBase;
     if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    
+
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((LPBYTE)loaderBase + pDos->e_lfanew);
     if (pNt->Signature != IMAGE_NT_SIGNATURE) return;
-    
+
     DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
-    
+
+    /* ── Detect XOR key for encrypted .text pages ── */
+    DetectXorKey(loaderBase, imageSize);
+    if (g_xorKey)
+        DebugLogFmt("Loader XOR key: 0x%016llX", (unsigned long long)g_xorKey);
+    else
+        DebugLog("Loader XOR key: none detected");
+
     DecryptGadgetFunc loaderGadget = FindLoaderDecryptGadget(loaderBase, imageSize);
     if (loaderGadget) {
         snprintf(logBuf, sizeof(logBuf), "Loader gadget: %p", (void*)loaderGadget);
         DebugLog(logBuf);
     }
-    
+
     DecryptGadgetFunc useGadget = loaderGadget ? loaderGadget : g_decryptGadget;
-    
+
     PVOID dumpBuffer = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!dumpBuffer) return;
-    
+
     memcpy(dumpBuffer, loaderBase, pNt->OptionalHeader.SizeOfHeaders);
-    
+
     PIMAGE_SECTION_HEADER pSections = IMAGE_FIRST_SECTION(pNt);
     DWORD pageSize = 4096;
     DWORD pagesDecrypted = 0, pagesCopied = 0;
-    
+    DWORD pagesGadget = 0, pagesXor = 0, pagesPlain = 0;
+
     for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
         PIMAGE_SECTION_HEADER pSec = &pSections[i];
         char secName[9] = {0};
         memcpy(secName, pSec->Name, 8);
-        
+
         DWORD secRVA = pSec->VirtualAddress;
         DWORD secSize = pSec->Misc.VirtualSize;
         if (secSize == 0) secSize = pSec->SizeOfRawData;
         if (secRVA + secSize > imageSize) continue;
-        
+
         BOOL isCodeSection = (pSec->Characteristics & IMAGE_SCN_CNT_CODE) ||
                              (secName[0] == '.' && secName[1] == 't' && secName[2] == 'e');
-        
+
         for (DWORD offset = 0; offset < secSize; offset += pageSize) {
             DWORD copySize = (offset + pageSize > secSize) ? (secSize - offset) : pageSize;
             PVOID srcPage = (LPBYTE)loaderBase + secRVA + offset;
             PVOID dstPage = (LPBYTE)dumpBuffer + secRVA + offset;
-            
+
             MEMORY_BASIC_INFORMATION mbi;
             if (VirtualQuery(srcPage, &mbi, sizeof(mbi)) == 0) continue;
-            
-            BOOL decrypted = FALSE;
-            
-            if (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0) {
-                if (isCodeSection && useGadget && copySize == pageSize) {
-                    DWORD oldProt;
-                    if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
+
+            BOOL needsUnprotect = (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0);
+            BOOL hasGuard = (mbi.Protect & PAGE_GUARD) != 0;
+            BOOL done = FALSE;
+
+            if (needsUnprotect || hasGuard) {
+                /* Temporarily make the page RWX so we can read/decrypt it */
+                DWORD oldProt;
+                if (!VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READWRITE, &oldProt))
+                    continue;
+
+                if (isCodeSection) {
+                    /* Strategy 1: gadget-based decryption */
+                    if (!done && useGadget && copySize == pageSize) {
                         UINT64* src = (UINT64*)srcPage;
                         UINT64* dst = (UINT64*)dstPage;
-                        for (int q = 0; q < 512; q++) {
+                        for (int q = 0; q < 512; q++)
                             dst[q] = useGadget(&src[q]);
+                        pagesGadget++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                    }
+
+                    /* Strategy 2: XOR key decryption (only if page
+                     * doesn't already look like valid code) */
+                    if (!done && g_xorKey) {
+                        uint8_t sample[256];
+                        DWORD sampleLen = copySize < 256 ? copySize : 256;
+                        memcpy(sample, srcPage, sampleLen);
+                        if (ScoreAsCode(sample, sampleLen) < 20) {
+                            TryXorDecryptRange(srcPage, dstPage, copySize);
+                            /* Verify decryption produced valid code */
+                            memcpy(sample, dstPage, sampleLen);
+                            if (ScoreAsCode(sample, sampleLen) > 20) {
+                                pagesXor++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                            }
                         }
-                        VirtualProtect(srcPage, copySize, oldProt, &oldProt);
-                        decrypted = TRUE;
-                        pagesDecrypted++;
-                        pagesCopied++;
                     }
-                }
-                
-                if (!decrypted) {
-                    DWORD oldProt;
-                    if (VirtualProtect(srcPage, copySize, PAGE_READONLY, &oldProt)) {
+
+                    /* Strategy 3: raw copy (may still be encrypted) */
+                    if (!done) {
                         memcpy(dstPage, srcPage, copySize);
-                        VirtualProtect(srcPage, copySize, oldProt, &oldProt);
-                        pagesCopied++;
+                        pagesPlain++; pagesCopied++; done = TRUE;
                     }
-                }
-            } else if (!(mbi.Protect & PAGE_GUARD)) {
-                if (isCodeSection && useGadget && copySize == pageSize) {
-                    UINT64* src = (UINT64*)srcPage;
-                    UINT64* dst = (UINT64*)dstPage;
-                    for (int q = 0; q < 512; q++) {
-                        dst[q] = useGadget(&src[q]);
-                    }
-                    pagesDecrypted++;
-                    pagesCopied++;
                 } else {
                     memcpy(dstPage, srcPage, copySize);
-                    pagesCopied++;
+                    pagesPlain++; pagesCopied++; done = TRUE;
+                }
+
+                /* Restore original page protection */
+                VirtualProtect(srcPage, copySize, oldProt, &oldProt);
+            } else {
+                /* Page is already accessible */
+                if (isCodeSection) {
+                    /* Check if page already looks like valid code */
+                    uint8_t sample[256];
+                    DWORD sampleLen = copySize < 256 ? copySize : 256;
+                    memcpy(sample, srcPage, sampleLen);
+                    BOOL looksValid = (ScoreAsCode(sample, sampleLen) > 20);
+
+                    if (!looksValid) {
+                        /* Page is accessible but encrypted — try decryption */
+                        /* Strategy 1: gadget-based decryption */
+                        if (!done && useGadget && copySize == pageSize) {
+                            UINT64* src = (UINT64*)srcPage;
+                            UINT64* dst = (UINT64*)dstPage;
+                            for (int q = 0; q < 512; q++)
+                                dst[q] = useGadget(&src[q]);
+                            pagesGadget++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                        }
+
+                        /* Strategy 2: XOR key decryption */
+                        if (!done && g_xorKey) {
+                            TryXorDecryptRange(srcPage, dstPage, copySize);
+                            memcpy(sample, dstPage, sampleLen);
+                            if (ScoreAsCode(sample, sampleLen) > 20) {
+                                pagesXor++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                            }
+                        }
+                    }
+
+                    /* Fallback: raw copy */
+                    if (!done) {
+                        memcpy(dstPage, srcPage, copySize);
+                        pagesPlain++; pagesCopied++; done = TRUE;
+                    }
+                } else {
+                    memcpy(dstPage, srcPage, copySize);
+                    pagesPlain++; pagesCopied++; done = TRUE;
                 }
             }
         }
+
+        if (isCodeSection)
+            DebugLogFmt("  Loader section %s: gadget=%lu xor=%lu plain=%lu",
+                        secName, pagesGadget, pagesXor, pagesPlain);
     }
-    
-    PIMAGE_DOS_HEADER pDumpDos = (PIMAGE_DOS_HEADER)dumpBuffer;
-    PIMAGE_NT_HEADERS pDumpNt = (PIMAGE_NT_HEADERS)((LPBYTE)dumpBuffer + pDumpDos->e_lfanew);
-    PIMAGE_SECTION_HEADER pDumpSections = IMAGE_FIRST_SECTION(pDumpNt);
-    
-    for (WORD i = 0; i < pDumpNt->FileHeader.NumberOfSections; i++) {
-        PIMAGE_SECTION_HEADER pSec = &pDumpSections[i];
-        pSec->PointerToRawData = pSec->VirtualAddress;
-        pSec->SizeOfRawData = pSec->Misc.VirtualSize;
+
+    DebugLogFmt("Loader dump: %lu pages copied, %lu decrypted (gadget=%lu xor=%lu plain=%lu)",
+                pagesCopied, pagesDecrypted, pagesGadget, pagesXor, pagesPlain);
+
+    /* ── Comprehensive PE header fixup ── */
+    {
+        PIMAGE_DOS_HEADER pDumpDos = (PIMAGE_DOS_HEADER)dumpBuffer;
+        PIMAGE_NT_HEADERS pDumpNt = (PIMAGE_NT_HEADERS)((LPBYTE)dumpBuffer + pDumpDos->e_lfanew);
+        PIMAGE_SECTION_HEADER pDumpSections = IMAGE_FIRST_SECTION(pDumpNt);
+        DWORD sectionAlignment = pDumpNt->OptionalHeader.SectionAlignment;
+        DWORD numDir = pDumpNt->OptionalHeader.NumberOfRvaAndSizes;
+
+        /* 1. Section table: align raw layout with virtual layout.
+         *    SizeOfRawData is aligned to FileAlignment (= SectionAlignment).
+         *    VirtualSize is aligned to SectionAlignment for validity. */
+        for (WORD i = 0; i < pDumpNt->FileHeader.NumberOfSections; i++) {
+            PIMAGE_SECTION_HEADER pSec = &pDumpSections[i];
+            DWORD vsize = pSec->Misc.VirtualSize;
+            /* Align SizeOfRawData up to section alignment */
+            DWORD alignedSize = (vsize + sectionAlignment - 1) & ~(sectionAlignment - 1);
+            pSec->SizeOfRawData = alignedSize;
+            pSec->PointerToRawData = pSec->VirtualAddress;
+            /* Align VirtualSize up to section alignment */
+            pSec->Misc.VirtualSize = alignedSize;
+        }
+        pDumpNt->OptionalHeader.FileAlignment = sectionAlignment;
+
+        /* 2. Reset ImageBase to a conventional 64-bit base */
+        pDumpNt->OptionalHeader.ImageBase = 0x140000000ULL;
+
+        /* 3. Zero directories that are runtime-only or invalid in a file dump */
+#define ZERO_DIR(idx) \
+        if (numDir > (idx)) { \
+            pDumpNt->OptionalHeader.DataDirectory[(idx)].VirtualAddress = 0; \
+            pDumpNt->OptionalHeader.DataDirectory[(idx)].Size = 0; \
+        }
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_SECURITY);
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT);
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        ZERO_DIR(IMAGE_DIRECTORY_ENTRY_DEBUG);
+#undef ZERO_DIR
+
+        /* 4. Zero the exception (.pdata) directory — encrypted unwind info
+         *    causes IDA to skip functions. Zeroing forces heuristic analysis. */
+        if (numDir > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+            pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0;
+            pDumpNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = 0;
+        }
+
+        /* 5. Clear the DLL flag so IDA/Ghidra treat it as a DLL properly */
+        /* Keep DLL flag — this IS a DLL dump */
+
+        DebugLog("Loader PE fixup: ImageBase=0x140000000, reloc/debug/security/pdata zeroed");
     }
-    pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
-    
+
+    /* ── Reconstruct IAT ── */
+    ReconstructIAT(loaderBase, dumpBuffer, imageSize);
+
+    /* ── Write the dump file ── */
     char loaderVerStr[64];
     GetExeVersionString(loaderVerStr, sizeof(loaderVerStr));
     char loaderDumpName[128];
@@ -2218,20 +2531,20 @@ static void DumpWowLoader(void) {
 
     HANDLE hFile = CreateFileA(OutputPath(loaderDumpName), GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    
+
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD bytesWritten = 0;
         WriteFile(hFile, dumpBuffer, imageSize, &bytesWritten, NULL);
         CloseHandle(hFile);
-        snprintf(logBuf, sizeof(logBuf), "Loader: %lu bytes (%lu pages decrypted)", 
+        snprintf(logBuf, sizeof(logBuf), "Loader: %lu bytes (%lu pages decrypted)",
                  bytesWritten, pagesDecrypted);
         DebugLog(logBuf);
     }
-    
+
     DumpLoaderExports(loaderBase, pNt);
     ExtractLoaderFunctions(dumpBuffer, imageSize, pNt, loaderBase);
     ExtractLoaderCrypto(dumpBuffer, imageSize);
-    
+
     SecureZeroBuffer(dumpBuffer, imageSize);
     VirtualFree(dumpBuffer, 0, MEM_RELEASE);
 }
@@ -2755,6 +3068,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
         InitializeCriticalSection(&g_tlsLock);
         InitializeCriticalSection(&g_offsetLock);
         DisableThreadLibraryCalls(hModule);
+        ResolveAllSsns();
 
         PPEB peb = GET_PEB();
         if (peb && peb->ImageBaseAddress) {
