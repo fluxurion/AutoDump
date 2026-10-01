@@ -5,6 +5,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <process.h>
 #include <stdarg.h>

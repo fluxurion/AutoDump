@@ -11,12 +11,20 @@ if %errorlevel% neq 0 (
 set CC=gcc
 set CFLAGS=-O2
 
+:: Fallback: VS-bundled clang (GNU mode) — handles the __asm__ syscall stubs.
+where gcc >nul 2>nul
+if %errorlevel% neq 0 (
+    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
+    set "CC=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin\clang.exe"
+    set CFLAGS=-O2 -fuse-ld=lld
+)
+
 echo ============================================
 echo  Reverse Engineering Toolkit - Compilation
 echo ============================================
 echo.
 echo [1/3] Compiling injector.exe ...
-%CC% %CFLAGS% -o injector.exe injector.c
+"%CC%" %CFLAGS% -o injector.exe injector.c
 if %errorlevel% equ 0 (
     echo   [+] injector.exe created successfully
 ) else (
@@ -27,7 +35,7 @@ if %errorlevel% equ 0 (
 
 echo.
 echo [2/3] Compiling helper.dll ...
-%CC% %CFLAGS% -shared -o helper.dll helper_dll.c
+"%CC%" %CFLAGS% -shared -o helper.dll helper_dll.c
 if %errorlevel% equ 0 (
     echo   [+] helper.dll created successfully
 ) else (
@@ -38,7 +46,7 @@ if %errorlevel% equ 0 (
 
 echo.
 echo [3/3] Compiling injector_gui.exe ...
-%CC% %CFLAGS% -mwindows -o injector_gui.exe injector_gui.c -lcomctl32 -lcomdlg32
+"%CC%" %CFLAGS% -mwindows -o injector_gui.exe injector_gui.c -lcomctl32 -lcomdlg32 -luser32 -lgdi32 -lshell32 -lole32 -luuid
 if %errorlevel% equ 0 (
     echo   [+] injector_gui.exe created successfully
 ) else (

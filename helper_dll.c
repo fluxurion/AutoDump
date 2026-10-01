@@ -174,14 +174,31 @@ static DecryptGadgetFunc g_decryptGadget = NULL;
 static UINT64 g_xorKey   = 0;
 static BOOL   g_xorReady = FALSE;
 
-static volatile BOOL g_pageCopyFailed = FALSE;
+static volatile BOOL  g_pageCopyFailed = FALSE;
+static volatile PVOID g_probeTarget    = NULL; /* page currently being fault-probed */
+static PVOID          g_failRetStub    = NULL; /* `ret` stub — resumes a declined probe call */
+static PVOID          g_pageCopyVehHandle = NULL;
+static DWORD          g_execProbeFails = 0;
+#define EXEC_PROBE_MAX_FAILS 24
 
+/*
+ * Probe VEH — registered with First=0 so the packer's own handlers run
+ * first. It only sees faults the packer declined: when a read-probe hits
+ * a page that stays protected we resume the faulting gadget call through
+ * a ret stub and flag the page as still-encrypted.
+ */
 static LONG CALLBACK PageCopyVEH(PEXCEPTION_POINTERS ep) {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        g_pageCopyFailed = TRUE;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
+    DWORD64 probe = (DWORD64)g_probeTarget;
+    if (!probe) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD64 addr = (DWORD64)ep->ExceptionRecord->ExceptionAddress;
+    if (addr < probe || addr >= probe + 4096)
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_pageCopyFailed = TRUE;
+    if (g_failRetStub)
+        ep->ContextRecord->Rip = (DWORD64)g_failRetStub;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 /* Crash catcher — logs the first unique exception, then stays silent.
@@ -223,25 +240,29 @@ static LONG CALLBACK CrashCatcherVEH(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static BOOL DecryptPageWithGadget(PVOID srcPage, PVOID dstBuffer) {
-    if (!g_decryptGadget) return FALSE;
+/*
+ * Fault-probe page copy. The packer decrypts a protected page from its
+ * own VEH the moment a fault touches it — so we must NOT unprotect the
+ * page first (that would defeat the trap and return ciphertext). The
+ * gadget executes inside the module's .text, so the fault looks like
+ * legitimate code flow to the packer's exception filter.
+ */
+static BOOL DecryptPageWithGadgetEx(DecryptGadgetFunc gadget, PVOID srcPage, PVOID dstBuffer) {
+    if (!gadget) return FALSE;
     UINT64* src = (UINT64*)srcPage;
     UINT64* dst = (UINT64*)dstBuffer;
-    for (int i = 0; i < 512; i++)
-        dst[i] = g_decryptGadget(&src[i]);
+    g_probeTarget = srcPage;
+    g_pageCopyFailed = FALSE;
+    for (int i = 0; i < 512; i++) {
+        dst[i] = gadget(&src[i]);
+        if (g_pageCopyFailed) { g_probeTarget = NULL; return FALSE; }
+    }
+    g_probeTarget = NULL;
     return TRUE;
 }
 
-static BOOL CopyPageAfterTouch(PVOID srcPage, PVOID dstBuffer) {
-    if (!g_decryptGadget) {
-        memcpy(dstBuffer, srcPage, 4096);
-        return TRUE;
-    }
-    UINT64* src = (UINT64*)srcPage;
-    UINT64* dst = (UINT64*)dstBuffer;
-    for (int i = 0; i < 512; i++)
-        dst[i] = g_decryptGadget(&src[i]);
-    return TRUE;
+static BOOL DecryptPageWithGadget(PVOID srcPage, PVOID dstBuffer) {
+    return DecryptPageWithGadgetEx(g_decryptGadget, srcPage, dstBuffer);
 }
 
 /*
@@ -1014,58 +1035,155 @@ static volatile BOOL g_execDecryptSuccess = FALSE;
 static HANDLE g_execDecryptEvent = NULL;
 static volatile DWORD g_decryptedPages = 0;
 
+static volatile DWORD g_execProbeTid = 0;
+
 static LONG CALLBACK DecryptCaptureVEH(PEXCEPTION_POINTERS ep) {
     if (!g_execDecryptInProgress) return EXCEPTION_CONTINUE_SEARCH;
-    
-    DWORD code = ep->ExceptionRecord->ExceptionCode;
-    DWORD64 addr = (DWORD64)ep->ExceptionRecord->ExceptionAddress;
+
+    DWORD   code   = ep->ExceptionRecord->ExceptionCode;
+    DWORD64 addr   = (DWORD64)ep->ExceptionRecord->ExceptionAddress;
+    DWORD64 rip    = ep->ContextRecord ? (DWORD64)ep->ContextRecord->Rip : 0;
     DWORD64 target = (DWORD64)g_execDecryptTarget;
-    
-    if (code == EXCEPTION_SINGLE_STEP) {
-        if (addr >= target && addr < target + 4096) {
-            memcpy(g_execDecryptDest, g_execDecryptTarget, 4096);
-            g_execDecryptSuccess = TRUE;
-            g_decryptedPages++;
+
+    BOOL addrInPage  = (addr >= target && addr < target + 4096);
+    BOOL ripInPage   = (rip  >= target && rip  < target + 4096);
+    BOOL probeThread = (g_execProbeTid && GetCurrentThreadId() == g_execProbeTid);
+    if (!addrInPage && !ripInPage && !probeThread)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /*
+     * A fetch fault with addr == RIP reaching us means the packer (which
+     * sits earlier in the VEH chain) declined to decrypt — probe failed.
+     * Any other exception means code in the page actually ran, i.e. the
+     * page is now plaintext — snapshot it. The probeThread catch-all
+     * keeps a wandering probe thread from ever escaping unhandled.
+     */
+    if (!(code == EXCEPTION_ACCESS_VIOLATION && addrInPage && addr == rip)) {
+        memcpy(g_execDecryptDest, g_execDecryptTarget, 4096);
+        g_execDecryptSuccess = TRUE;
+        g_decryptedPages++;
+    } else {
+        g_execDecryptSuccess = FALSE;
+    }
+
+    g_execDecryptInProgress = FALSE;
+    if (g_execDecryptEvent) SetEvent(g_execDecryptEvent);
+    ep->ContextRecord->Rip = (DWORD64)ExitThread;
+    ep->ContextRecord->Rcx = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/*
+ * Force a cipher page to decrypt by executing into it. A sacrificial
+ * thread is created suspended with its entry point = the target page and
+ * a DR0 execution breakpoint armed on the first byte. On resume:
+ *
+ *   1. The instruction fetch faults (execute-AV) — the packer's VEH sees
+ *      it first and decrypts the page in place.
+ *   2. On resume the DR0 breakpoint fires before a single instruction of
+ *      decrypted code runs — EXCEPTION_SINGLE_STEP inside the page.
+ *   3. DecryptCaptureVEH snapshots the plaintext and redirects the
+ *      thread to ExitThread.
+ *
+ * If the packer declines the fetch fault it reaches our VEH instead and
+ * the probe reports failure — no decrypted instruction ever executes.
+ * Returns TRUE if plaintext was captured (or the page turned readable).
+ */
+static BOOL ForceDecryptByExecute(PVOID srcPage, PVOID dstBuffer) {
+    if (!g_execDecryptEvent) return FALSE;
+    if (g_execProbeFails >= EXEC_PROBE_MAX_FAILS) return FALSE;
+
+    EnterCriticalSection(&g_decryptLock);
+    g_execDecryptTarget     = srcPage;
+    g_execDecryptDest       = dstBuffer;
+    g_execDecryptSuccess    = FALSE;
+    ResetEvent(g_execDecryptEvent);
+    g_execDecryptInProgress = TRUE;
+
+    DWORD tid;
+    HANDLE h = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)srcPage, NULL,
+                            CREATE_SUSPENDED, &tid);
+    if (h) {
+        g_execProbeTid = tid;
+        CONTEXT ctx;
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &ctx)) {
+            ctx.Dr0 = (DWORD64)srcPage;
+            ctx.Dr7 |= 0x1; /* L0 — local enable, execution bp */
+            SetThreadContext(h, &ctx);
+        }
+        ResumeThread(h);
+
+        if (WaitForSingleObject(g_execDecryptEvent, 150) == WAIT_TIMEOUT) {
+            /* Probe lost — thread wandered off the page or hung. */
             g_execDecryptInProgress = FALSE;
-            if (g_execDecryptEvent) SetEvent(g_execDecryptEvent);
-            
-            ep->ContextRecord->Rip = (DWORD64)ExitThread;
-            ep->ContextRecord->Rcx = 0;
-            return EXCEPTION_CONTINUE_EXECUTION;
+            TerminateThread(h, 0);
+        }
+        CloseHandle(h);
+        g_execProbeTid = 0;
+    } else {
+        g_execDecryptInProgress = FALSE;
+    }
+
+    BOOL ok = g_execDecryptSuccess;
+    /* If the packer never decrypted, the capture holds ciphertext —
+       verify before trusting it. */
+    if (ok && ScoreAsCode((uint8_t*)dstBuffer, 256) < 8)
+        ok = FALSE;
+    if (!ok) {
+        /* Late capture: the packer may have decrypted the page even if
+           the breakpoint never reached us. */
+        MEMORY_BASIC_INFORMATION m2;
+        if (VirtualQuery(srcPage, &m2, sizeof(m2)) &&
+            m2.Protect != PAGE_NOACCESS && m2.Protect != 0 &&
+            !(m2.Protect & PAGE_GUARD)) {
+            uint8_t sample[64];
+            memcpy(sample, srcPage, sizeof(sample));
+            if (ScoreAsCode(sample, sizeof(sample)) > 8) {
+                memcpy(dstBuffer, srcPage, 4096);
+                ok = TRUE;
+            }
         }
     }
-    
-    if (code == EXCEPTION_BREAKPOINT) {
-        if (addr >= target && addr < target + 4096) {
-            memcpy(g_execDecryptDest, g_execDecryptTarget, 4096);
-            g_execDecryptSuccess = TRUE;
-            g_decryptedPages++;
-            g_execDecryptInProgress = FALSE;
-            if (g_execDecryptEvent) SetEvent(g_execDecryptEvent);
-            ep->ContextRecord->Rip = (DWORD64)ExitThread;
-            ep->ContextRecord->Rcx = 0;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    }
-    
-    return EXCEPTION_CONTINUE_SEARCH;
+
+    if (ok)
+        g_execProbeFails = 0;
+    else
+        InterlockedIncrement(&g_execProbeFails);
+
+    LeaveCriticalSection(&g_decryptLock);
+    return ok;
 }
 
 static BOOL InitForcedDecryption(void) {
     InitializeCriticalSection(&g_decryptLock);
-    
+
     g_forceDecrypt.completionEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!g_forceDecrypt.completionEvent) return FALSE;
-    
+    g_execDecryptEvent             = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_forceDecrypt.completionEvent || !g_execDecryptEvent) return FALSE;
+
     g_forceDecrypt.pageSize = 4096;
     g_forceDecrypt.inProgress = FALSE;
-    
+
+    /* ret stub used to unwind a declined gadget probe */
+    g_failRetStub = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                                 PAGE_EXECUTE_READWRITE);
+    if (g_failRetStub) {
+        ((uint8_t*)g_failRetStub)[0] = 0xC3; /* ret */
+        DWORD op;
+        VirtualProtect(g_failRetStub, 4096, PAGE_EXECUTE_READ, &op);
+    }
+
     g_vehHandle = AddVectoredExceptionHandler(0, DecryptCaptureVEH);
     if (!g_vehHandle) {
         CloseHandle(g_forceDecrypt.completionEvent);
+        CloseHandle(g_execDecryptEvent);
         return FALSE;
     }
-    
+
+    /* Probe VEH — appended last so the packer's handlers see faults first */
+    g_pageCopyVehHandle = AddVectoredExceptionHandler(0, PageCopyVEH);
+
     return TRUE;
 }
 
@@ -1074,9 +1192,21 @@ static void CleanupForcedDecryption(void) {
         RemoveVectoredExceptionHandler(g_vehHandle);
         g_vehHandle = NULL;
     }
+    if (g_pageCopyVehHandle) {
+        RemoveVectoredExceptionHandler(g_pageCopyVehHandle);
+        g_pageCopyVehHandle = NULL;
+    }
     if (g_forceDecrypt.completionEvent) {
         CloseHandle(g_forceDecrypt.completionEvent);
         g_forceDecrypt.completionEvent = NULL;
+    }
+    if (g_execDecryptEvent) {
+        CloseHandle(g_execDecryptEvent);
+        g_execDecryptEvent = NULL;
+    }
+    if (g_failRetStub) {
+        VirtualFree(g_failRetStub, 0, MEM_RELEASE);
+        g_failRetStub = NULL;
     }
     DeleteCriticalSection(&g_decryptLock);
 }
@@ -2310,6 +2440,7 @@ static void DumpWowLoader(void) {
 
     PVOID loaderBase = FindModuleByName(L"Wow_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowT_loader.dll");
+    if (!loaderBase) loaderBase = FindModuleByName(L"WowB_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowClassic_loader.dll");
     if (!loaderBase) loaderBase = FindModuleByName(L"WowClassicT_loader.dll");
     if (!loaderBase) return;
@@ -2373,49 +2504,50 @@ static void DumpWowLoader(void) {
             BOOL done = FALSE;
 
             if (needsUnprotect || hasGuard) {
-                /* Temporarily make the page RWX so we can read/decrypt it */
-                DWORD oldProt;
-                if (!VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READWRITE, &oldProt))
-                    continue;
+                /* Fault the protected page BEFORE unprotecting — the
+                 * packer's VEH decrypts on the fault. Unprotecting first
+                 * bypasses the trap and yields ciphertext. */
+                if (isCodeSection && copySize == pageSize && useGadget &&
+                    DecryptPageWithGadgetEx(useGadget, srcPage, dstPage)) {
+                    pagesGadget++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                }
 
-                if (isCodeSection) {
-                    /* Strategy 1: gadget-based decryption */
-                    if (!done && useGadget && copySize == pageSize) {
-                        UINT64* src = (UINT64*)srcPage;
-                        UINT64* dst = (UINT64*)dstPage;
-                        for (int q = 0; q < 512; q++)
-                            dst[q] = useGadget(&src[q]);
-                        pagesGadget++; pagesDecrypted++; pagesCopied++; done = TRUE;
-                    }
+                if (!done) {
+                    /* Temporarily make the page RWX so we can read/decrypt it */
+                    DWORD oldProt;
+                    if (!VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READWRITE, &oldProt))
+                        continue;
 
-                    /* Strategy 2: XOR key decryption (only if page
-                     * doesn't already look like valid code) */
-                    if (!done && g_xorKey) {
-                        uint8_t sample[256];
-                        DWORD sampleLen = copySize < 256 ? copySize : 256;
-                        memcpy(sample, srcPage, sampleLen);
-                        if (ScoreAsCode(sample, sampleLen) < 20) {
-                            TryXorDecryptRange(srcPage, dstPage, copySize);
-                            /* Verify decryption produced valid code */
-                            memcpy(sample, dstPage, sampleLen);
-                            if (ScoreAsCode(sample, sampleLen) > 20) {
-                                pagesXor++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                    if (isCodeSection) {
+                        /* Strategy 2: XOR key decryption (only if page
+                         * doesn't already look like valid code) */
+                        if (!done && g_xorKey) {
+                            uint8_t sample[256];
+                            DWORD sampleLen = copySize < 256 ? copySize : 256;
+                            memcpy(sample, srcPage, sampleLen);
+                            if (ScoreAsCode(sample, sampleLen) < 20) {
+                                TryXorDecryptRange(srcPage, dstPage, copySize);
+                                /* Verify decryption produced valid code */
+                                memcpy(sample, dstPage, sampleLen);
+                                if (ScoreAsCode(sample, sampleLen) > 20) {
+                                    pagesXor++; pagesDecrypted++; pagesCopied++; done = TRUE;
+                                }
                             }
                         }
-                    }
 
-                    /* Strategy 3: raw copy (may still be encrypted) */
-                    if (!done) {
+                        /* Strategy 3: raw copy (may still be encrypted) */
+                        if (!done) {
+                            memcpy(dstPage, srcPage, copySize);
+                            pagesPlain++; pagesCopied++; done = TRUE;
+                        }
+                    } else {
                         memcpy(dstPage, srcPage, copySize);
                         pagesPlain++; pagesCopied++; done = TRUE;
                     }
-                } else {
-                    memcpy(dstPage, srcPage, copySize);
-                    pagesPlain++; pagesCopied++; done = TRUE;
-                }
 
-                /* Restore original page protection */
-                VirtualProtect(srcPage, copySize, oldProt, &oldProt);
+                    /* Restore original page protection */
+                    VirtualProtect(srcPage, copySize, oldProt, &oldProt);
+                }
             } else {
                 /* Page is already accessible */
                 if (isCodeSection) {
@@ -2489,8 +2621,11 @@ static void DumpWowLoader(void) {
         }
         pDumpNt->OptionalHeader.FileAlignment = sectionAlignment;
 
-        /* 2. Reset ImageBase to a conventional 64-bit base */
-        pDumpNt->OptionalHeader.ImageBase = 0x140000000ULL;
+        /* 2. Keep the REAL runtime image base. Every pointer inside the
+         *    dump (vtables, globals, string refs) is a live VA based at
+         *    moduleBase -- stamping 0x140000000 makes IDA load the image
+         *    at the wrong base and every absolute pointer dangles. */
+        pDumpNt->OptionalHeader.ImageBase = (ULONG64)loaderBase;
 
         /* 3. Zero directories that are runtime-only or invalid in a file dump */
 #define ZERO_DIR(idx) \
@@ -2514,7 +2649,8 @@ static void DumpWowLoader(void) {
         /* 5. Clear the DLL flag so IDA/Ghidra treat it as a DLL properly */
         /* Keep DLL flag — this IS a DLL dump */
 
-        DebugLog("Loader PE fixup: ImageBase=0x140000000, reloc/debug/security/pdata zeroed");
+        DebugLogFmt("Loader PE fixup: ImageBase=%p, reloc/debug/security/pdata zeroed",
+                    loaderBase);
     }
 
     /* ── Reconstruct IAT ── */
@@ -2767,7 +2903,7 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
                     isCodeSection ? "code" : "data",
                     (pSec->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) ? " init" : "");
         
-        DWORD pagesGadget = 0, pagesXor = 0, pagesPlain = 0;
+        DWORD pagesGadget = 0, pagesXor = 0, pagesPlain = 0, pagesExec = 0;
 
         for (DWORD offset = 0; offset < secSize; offset += pageSize) {
             DWORD copySize = (offset + pageSize > secSize) ? (secSize - offset) : pageSize;
@@ -2777,68 +2913,85 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
             MEMORY_BASIC_INFORMATION mbi;
             if (VirtualQuery(srcPage, &mbi, sizeof(mbi)) == 0) continue;
 
-            BOOL needsDecrypt = (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0);
-            BOOL accessible   = !needsDecrypt && !(mbi.Protect & PAGE_GUARD);
+            BOOL needsDecrypt = (mbi.Protect == PAGE_NOACCESS || mbi.Protect == 0 ||
+                                 (mbi.Protect & PAGE_GUARD));
+            BOOL accessible   = !needsDecrypt;
             BOOL done = FALSE;
 
-            if (needsDecrypt && isCodeSection && copySize == pageSize) {
-                /* Strategy 1: gadget-based decryption */
-                if (!done && g_decryptGadget) {
-                    DWORD oldProt;
-                    if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
-                        if (DecryptPageWithGadget(srcPage, dstPage)) {
-                            pagesGadget++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
+            if (needsDecrypt) {
+                /*
+                 * The packer decrypts a protected page from its own VEH the
+                 * moment a fault touches it. The old code unprotected the
+                 * page FIRST — the trap never fired and the gadget copied
+                 * ciphertext, which is exactly why the 1.60 dump came out
+                 * encrypted. Fault the still-protected page instead.
+                 */
+                if (copySize == pageSize) {
+                    /* Strategy 1: read-probe through the in-module gadget
+                     * (fault RIP stays inside WoW code → looks legit) */
+                    if (g_decryptGadget && DecryptPageWithGadget(srcPage, dstPage))
+                        { pagesGadget++; pagesForceDecrypted++; done = TRUE; }
+
+                    /* Strategy 2: execute-probe — a sacrificial thread jumps
+                     * into the page, the fetch fault triggers the packer,
+                     * DecryptCaptureVEH snapshots the plaintext page. */
+                    if (!done && g_execDecryptEvent &&
+                        ForceDecryptByExecute(srcPage, dstPage))
+                        { pagesExec++; pagesForceDecrypted++; done = TRUE; }
+
+                    /* Strategy 3: static XOR key (readable-but-cipher) */
+                    if (!done && g_xorKey) {
+                        DWORD oldProt;
+                        if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
+                            if (TryXorDecryptPage(srcPage, dstPage) &&
+                                ScoreAsCode((uint8_t*)dstPage, 256) > 20)
+                                { pagesXor++; pagesForceDecrypted++; done = TRUE; }
+                            VirtualProtect(srcPage, copySize, oldProt, &oldProt);
                         }
-                        VirtualProtect(srcPage, copySize, oldProt, &oldProt);
                     }
                 }
-                /* Strategy 2: XOR key decryption */
-                if (!done && g_xorKey) {
-                    DWORD oldProt;
-                    if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
-                        if (TryXorDecryptPage(srcPage, dstPage)) {
-                            pagesXor++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
-                        }
-                        VirtualProtect(srcPage, copySize, oldProt, &oldProt);
-                    }
-                }
-                /* Strategy 3: force-touch then copy */
-                if (!done && CopyPageAfterTouch(srcPage, dstPage)) {
-                    pagesPlain++; pagesForceDecrypted++; pagesCopied++; done = TRUE;
-                }
-                /* Last resort: force page readable and raw copy */
+
+                /* Last resort: unprotect + raw copy (ciphertext is still
+                 * better than a hole — offline tools may crack it) */
                 if (!done) {
                     DWORD oldProt;
                     if (VirtualProtect(srcPage, copySize, PAGE_EXECUTE_READ, &oldProt)) {
                         SpoofedMemcpy(dstPage, srcPage, copySize);
                         VirtualProtect(srcPage, copySize, oldProt, &oldProt);
-                        pagesPlain++; pagesCopied++;
+                        pagesPlain++; done = TRUE;
                     }
                 }
-            } else if (accessible) {
-                /* Page is already readable */
+                if (done) pagesCopied++;
+            } else {
+                /* Page is already readable — code pages are plain by
+                 * definition under a fault-decrypt packer. */
                 if (isCodeSection && copySize == pageSize && g_decryptGadget) {
                     if (DecryptPageWithGadget(srcPage, dstPage))
-                        { pagesGadget++; pagesForceDecrypted++; pagesCopied++; }
+                        { pagesGadget++; pagesForceDecrypted++; }
                     else
-                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; pagesCopied++; }
+                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; }
                 } else if (isCodeSection && copySize == pageSize && g_xorKey) {
-                    if (TryXorDecryptPage(srcPage, dstPage))
-                        { pagesXor++; pagesForceDecrypted++; pagesCopied++; }
+                    uint8_t sample[256];
+                    memcpy(sample, srcPage, 256);
+                    if (ScoreAsCode(sample, 256) < 20 &&
+                        TryXorDecryptPage(srcPage, dstPage) &&
+                        ScoreAsCode((uint8_t*)dstPage, 256) > 20)
+                        { pagesXor++; pagesForceDecrypted++; }
                     else
-                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; pagesCopied++; }
+                        { SpoofedMemcpy(dstPage, srcPage, copySize); pagesPlain++; }
                 } else {
                     SpoofedMemcpy(dstPage, srcPage, copySize);
-                    pagesPlain++; pagesCopied++;
+                    pagesPlain++;
                 }
+                pagesCopied++;
             }
 
             if ((offset / pageSize) % 100 == 0) StealthSleep(0);
         }
 
-        if (isCodeSection && (pagesGadget || pagesXor || pagesForceDecrypted))
-            DebugLogFmt("  Section %s: gadget=%lu xor=%lu plain=%lu",
-                        secName, pagesGadget, pagesXor, pagesPlain);
+        if (isCodeSection && (pagesGadget || pagesXor || pagesExec || pagesForceDecrypted))
+            DebugLogFmt("  Section %s: gadget=%lu exec=%lu xor=%lu plain=%lu",
+                        secName, pagesGadget, pagesExec, pagesXor, pagesPlain);
 
         totalDecrypted += pagesForceDecrypted;
         totalCopied += pagesCopied;
@@ -2865,9 +3018,12 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         }
         pDumpNt->OptionalHeader.FileAlignment = pDumpNt->OptionalHeader.SectionAlignment;
 
-        /* 2. Reset ImageBase to a conventional 64-bit base so IDA
-         *    loads at a predictable address instead of the runtime VA. */
-        pDumpNt->OptionalHeader.ImageBase = 0x140000000ULL;
+        /* 2. Keep the REAL runtime image base. All pointers captured in
+         *    the dump are live VAs (vtables, globals, string references),
+         *    so forcing 0x140000000 makes IDA load the image at a base
+         *    where every absolute pointer dangles — the dump looks wrong.
+         *    Stamping the true runtime base keeps every reference valid. */
+        pDumpNt->OptionalHeader.ImageBase = (ULONG64)moduleBase;
 
         /* 3. Zero directories that are runtime-only or invalid in a file dump */
 #define ZERO_DIR(idx) \
@@ -2897,7 +3053,10 @@ static DWORD WINAPI DumpWorkerThread(LPVOID lpParam) {
         /* 5. Zero the DLL flag so IDA treats it as an EXE */
         pDumpNt->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
 
-        DebugLog("PE fixup done: ImageBase=0x140000000, reloc/debug/security/pdata zeroed");
+        snprintf(logBuf, sizeof(logBuf),
+                 "PE fixup done: ImageBase=%p, reloc/debug/security/pdata zeroed",
+                 moduleBase);
+        DebugLog(logBuf);
     }
     
     ScanAndTrackTlsCallbacks(moduleBase);
